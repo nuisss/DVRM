@@ -3,6 +3,7 @@ import re
 import asyncio
 import itertools
 import functools
+import datetime
 
 import discord
 from discord import app_commands
@@ -787,6 +788,59 @@ async def _sonrakini_cal(guild: discord.Guild):
         pass
 
 
+@bot.tree.command(name="sil", description="Bu kanalda belirtilen sayıda son mesajı siler.")
+@app_commands.describe(miktar="Silinecek mesaj sayısı (1-100 arası)")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def sil(interaction: discord.Interaction, miktar: app_commands.Range[int, 1, 100]):
+    if interaction.guild is None or not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message("Bu komut sadece sunucudaki bir metin kanalında kullanılabilir.", ephemeral=True)
+        return
+
+    if not interaction.channel.permissions_for(interaction.guild.me).manage_messages:
+        await interaction.response.send_message("Botun 'Mesajları Yönet' iznine ihtiyacım var.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    # Discord'un toplu silme (bulk delete) API'si 14 günden eski mesajları kabul etmez.
+    # Bu yüzden önce hedef mesajları çekip 14 günden yeni/eski diye ikiye ayırıyoruz:
+    # yeniler purge (toplu) ile, eskiler ise tek tek delete() ile silinir.
+    on_dort_gun_once = discord.utils.utcnow() - datetime.timedelta(days=14)
+
+    try:
+        mesajlar = [m async for m in interaction.channel.history(limit=miktar)]
+    except discord.HTTPException as e:
+        await interaction.followup.send(f"Mesajlar okunamadı: {e}", ephemeral=True)
+        return
+
+    yeni_mesajlar = [m for m in mesajlar if m.created_at >= on_dort_gun_once]
+    eski_mesajlar = [m for m in mesajlar if m.created_at < on_dort_gun_once]
+
+    toplam_silinen = 0
+
+    if yeni_mesajlar:
+        try:
+            silinenler = await interaction.channel.purge(limit=len(yeni_mesajlar))
+            toplam_silinen += len(silinenler)
+        except discord.HTTPException as e:
+            await interaction.followup.send(f"Mesajlar silinemedi: {e}", ephemeral=True)
+            return
+
+    for mesaj in eski_mesajlar:
+        try:
+            await mesaj.delete()
+            toplam_silinen += 1
+            await asyncio.sleep(1)  # rate limit'e takılmamak için mesaj başına küçük bekleme
+        except discord.HTTPException:
+            pass
+
+    await interaction.followup.send(
+        f"🗑️ {toplam_silinen} mesaj silindi"
+        + (f" ({len(eski_mesajlar)} tanesi 14 günden eski olduğu için tek tek silindi)." if eski_mesajlar else "."),
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(name="play", description="Şarkıyı kuyruğa ekler; sırada bir şey yoksa hemen çalar.")
 @app_commands.describe(sarki="Çalınacak şarkının adı veya YouTube linki")
 async def play(interaction: discord.Interaction, sarki: str):
@@ -957,6 +1011,7 @@ async def dur(interaction: discord.Interaction):
 @atkovaladurdur.error
 @godmode.error
 @godmodedurdur.error
+@sil.error
 @play.error
 @skip.error
 @sira_goster.error
