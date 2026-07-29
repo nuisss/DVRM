@@ -317,6 +317,14 @@ async def on_member_join(member: discord.Member):
         await kanal.send(f"⚠️ Rol oluşturulamadı: {e}")
         return
 
+    # --- 3.1) Özel rol verildi, artık geçici 'Üye' rolüne gerek yok: kaldır ---
+    uye_rolu = discord.utils.get(guild.roles, name=UYE_ROLU_ADI)
+    if uye_rolu is not None and uye_rolu in member.roles:
+        try:
+            await member.remove_roles(uye_rolu, reason="özel rol verildi - üye rolü kaldırıldı")
+        except discord.HTTPException as e:
+            print(f"Üye rolü kaldırılamadı ({member}): {e}")
+
     await kanal.send(
         f"✅ **{rol.name}** rolü oluşturuldu ve sana verildi! Bu kanal 10 saniye içinde silinecek."
     )
