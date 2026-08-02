@@ -66,6 +66,15 @@ def _kanal_adi_olustur(uye: discord.Member) -> str:
     return ad[:90]
 
 
+async def _kanali_uye_rolunden_gizle(kanal: discord.abc.GuildChannel, rol: discord.Role) -> None:
+    """Tek bir kanalı 'Üye' rolünden gizler. Ses/sahne kanallarında ekstra olarak
+    bağlanma iznini de kapatır ki görse bile sese giremesin."""
+    izinler = {"view_channel": False, "reason": "üye rolünden kanalı gizle"}
+    if isinstance(kanal, (discord.VoiceChannel, discord.StageChannel)):
+        izinler["connect"] = False
+    await kanal.set_permissions(rol, **izinler)
+
+
 async def _uye_rolu_getir_veya_olustur(guild: discord.Guild) -> discord.Role:
     """'Üye' rolünü döndürür; yoksa oluşturur ve mevcut tüm kanallardan gizler."""
     rol = discord.utils.get(guild.roles, name=UYE_ROLU_ADI)
@@ -84,13 +93,23 @@ async def _uye_rolu_getir_veya_olustur(guild: discord.Guild) -> discord.Role:
     # hiçbir kanalı göremez.
     for kanal in guild.channels:
         try:
-            await kanal.set_permissions(
-                rol, view_channel=False, reason="üye rolünden kanalı gizle"
-            )
+            await _kanali_uye_rolunden_gizle(kanal, rol)
         except discord.HTTPException:
             pass
 
     return rol
+
+
+@bot.event
+async def on_guild_channel_create(channel: discord.abc.GuildChannel):
+    """Sunucuda yeni bir kanal (metin/ses/kategori) açıldığında, henüz rol almamış
+    'Üye' rolündeki kişilerden otomatik olarak gizler. Bu sayede yeni açılan bir
+    ses kanalı bile rol verilmeden görünmez/erişilmez olur."""
+    try:
+        rol = await _uye_rolu_getir_veya_olustur(channel.guild)
+        await _kanali_uye_rolunden_gizle(channel, rol)
+    except discord.HTTPException as e:
+        print(f"Yeni kanal Üye rolünden gizlenemedi ({channel}): {e}")
 
 
 intents = discord.Intents.default()
@@ -334,6 +353,40 @@ async def on_member_join(member: discord.Member):
         await kanal.delete(reason="rol seçimi tamamlandı")
     except discord.HTTPException:
         pass
+
+
+@bot.tree.command(
+    name="kilitle",
+    description="Mevcut tüm kanalları 'Üye' rolünden gizler/kilitler (yeni eklenen ses kanalları dahil, geriye dönük düzeltme).",
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def kilitle(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Bu komut sadece sunucuda kullanılabilir.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+
+    try:
+        rol = await _uye_rolu_getir_veya_olustur(guild)
+    except discord.HTTPException as e:
+        await interaction.followup.send(f"'{UYE_ROLU_ADI}' rolü hazırlanamadı: {e}", ephemeral=True)
+        return
+
+    basarili = 0
+    basarisiz = 0
+    for kanal in guild.channels:
+        try:
+            await _kanali_uye_rolunden_gizle(kanal, rol)
+            basarili += 1
+        except discord.HTTPException:
+            basarisiz += 1
+
+    ozet = f"🔒 **{basarili}** kanal '{UYE_ROLU_ADI}' rolünden gizlendi/kilitlendi."
+    if basarisiz:
+        ozet += f" ({basarisiz} kanalda izin ayarlanamadı, bot'un yetkisini kontrol et.)"
+    await interaction.followup.send(ozet, ephemeral=True)
 
 
 async def gezdir_loop(member: discord.Member, kanallar: list[discord.VoiceChannel]):
@@ -1012,6 +1065,7 @@ async def dur(interaction: discord.Interaction):
 @godmode.error
 @godmodedurdur.error
 @sil.error
+@kilitle.error
 @play.error
 @skip.error
 @sira_goster.error
