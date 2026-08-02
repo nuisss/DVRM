@@ -100,6 +100,13 @@ async def _uye_rolu_getir_veya_olustur(guild: discord.Guild) -> discord.Role:
     return rol
 
 
+intents = discord.Intents.default()
+intents.voice_states = True
+intents.members = True
+intents.message_content = True  # isim mesajını okuyabilmek için gerekli
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
 @bot.event
 async def on_guild_channel_create(channel: discord.abc.GuildChannel):
     """Sunucuda yeni bir kanal (metin/ses/kategori) açıldığında, henüz rol almamış
@@ -111,13 +118,6 @@ async def on_guild_channel_create(channel: discord.abc.GuildChannel):
     except discord.HTTPException as e:
         print(f"Yeni kanal Üye rolünden gizlenemedi ({channel}): {e}")
 
-
-intents = discord.Intents.default()
-intents.voice_states = True
-intents.members = True
-intents.message_content = True  # isim mesajını okuyabilmek için gerekli
-
-bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Her guild + user için çalışan "gezdirme" görevlerini tutuyoruz
 # key: (guild_id, user_id) -> asyncio.Task
