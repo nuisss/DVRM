@@ -365,7 +365,7 @@ async def on_member_join(member: discord.Member):
 
 @bot.tree.command(
     name="kilitle",
-    description="Mevcut tüm kanalları 'Üye' rolünden gizler/kilitler (yeni eklenen ses kanalları dahil, geriye dönük düzeltme).",
+    description="Tüm kanalları 'Üye' rolünden gizler (geriye dönük, yeni ses kanalları dahil).",
 )
 @app_commands.checks.has_permissions(manage_guild=True)
 async def kilitle(interaction: discord.Interaction):
