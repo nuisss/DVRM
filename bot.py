@@ -214,11 +214,19 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 async def on_ready():
     try:
         synced = await bot.tree.sync()
-        print(f"{len(synced)} slash komut senkronize edildi.")
+        print(f"{len(synced)} slash komut global olarak senkronize edildi (yayılması ~1 saate kadar sürebilir).")
     except Exception as e:
-        print(f"Senkron hatası: {e}")
+        print(f"Global senkron hatası: {e}")
 
+    # Global senkron Discord tarafında geç yayılabildiği için, komutların her
+    # sunucuda ANINDA görünmesi için ayrıca guild bazlı da senkronluyoruz.
     for guild in bot.guilds:
+        try:
+            guild_synced = await bot.tree.sync(guild=guild)
+            print(f"'{guild.name}' sunucusunda {len(guild_synced)} komut anında senkronize edildi.")
+        except Exception as e:
+            print(f"'{guild.name}' guild senkron hatası: {e}")
+
         try:
             await _uye_rolu_getir_veya_olustur(guild)
         except discord.HTTPException as e:
