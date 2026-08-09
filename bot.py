@@ -119,6 +119,128 @@ async def on_guild_channel_create(channel: discord.abc.GuildChannel):
         print(f"Yeni kanal Üye rolünden gizlenemedi ({channel}): {e}")
 
 
+# ============================================
+# TICKET SİSTEMİ
+# ============================================
+TICKET_KATEGORI_ADI = "Tickets"
+TICKET_KANAL_ON_EK = "ticket-"
+
+
+class TicketCloseView(discord.ui.View):
+    """Ticket kanalının içine gönderilen mesajdaki 'Close Ticket' butonu."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Close Ticket", emoji="🔒", style=discord.ButtonStyle.danger, custom_id="ticket_close_button")
+    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        kanal = interaction.channel
+        if not isinstance(kanal, discord.TextChannel) or not kanal.name.startswith(TICKET_KANAL_ON_EK):
+            await interaction.response.send_message("Bu buton sadece ticket kanallarında çalışır.", ephemeral=True)
+            return
+
+        await interaction.response.send_message("🔒 Ticket kapatılıyor, kanal 5 saniye içinde silinecek...")
+        await asyncio.sleep(5)
+        try:
+            await kanal.delete(reason=f"{interaction.user} tarafından ticket kapatıldı")
+        except discord.HTTPException as e:
+            try:
+                await kanal.send(f"⚠️ Kanal silinemedi: {e}")
+            except discord.HTTPException:
+                pass
+
+
+class TicketPanelView(discord.ui.View):
+    """Panel mesajındaki 'Create ticket' butonu."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Create ticket", emoji="📩", style=discord.ButtonStyle.secondary, custom_id="ticket_create_button")
+    async def create_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        if guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Bu buton sadece sunucuda çalışır.", ephemeral=True)
+            return
+
+        kanal_adi = f"{TICKET_KANAL_ON_EK}{interaction.user.id}"
+        mevcut = discord.utils.get(guild.text_channels, name=kanal_adi)
+        if mevcut is not None:
+            await interaction.response.send_message(
+                f"Zaten açık bir ticket'ın var: {mevcut.mention}", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        kategori = discord.utils.get(guild.categories, name=TICKET_KATEGORI_ADI)
+        if kategori is None:
+            try:
+                kategori = await guild.create_category(TICKET_KATEGORI_ADI, reason="ticket sistemi kategorisi")
+            except discord.HTTPException as e:
+                await interaction.followup.send(f"⚠️ Ticket kategorisi oluşturulamadı: {e}", ephemeral=True)
+                return
+
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            guild.me: discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, manage_channels=True, read_message_history=True
+            ),
+            interaction.user: discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, read_message_history=True, attach_files=True
+            ),
+        }
+        # Yönetici (administrator) yetkisine sahip tüm roller de görebilsin
+        for rol in guild.roles:
+            if rol.permissions.administrator:
+                overwrites[rol] = discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, read_message_history=True
+                )
+
+        try:
+            ticket_kanal = await guild.create_text_channel(
+                kanal_adi,
+                category=kategori,
+                overwrites=overwrites,
+                reason=f"{interaction.user} ticket açtı",
+            )
+        except discord.HTTPException as e:
+            await interaction.followup.send(f"⚠️ Ticket kanalı oluşturulamadı: {e}", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="🎫 Destek Talebi",
+            description=(
+                f"Merhaba {interaction.user.mention}! Sorununu buraya olabildiğince detaylı yaz, "
+                f"yetkili ekibimiz en kısa sürede sana dönecek.\n\nİşin bittiğinde aşağıdaki butonla "
+                f"ticket'ı kapatabilirsin."
+            ),
+            color=discord.Color.blurple(),
+        )
+        await ticket_kanal.send(content=interaction.user.mention, embed=embed, view=TicketCloseView())
+        await interaction.followup.send(f"✅ Ticket'ın oluşturuldu: {ticket_kanal.mention}", ephemeral=True)
+
+
+@bot.tree.command(name="ticketpanel", description="Bu kanala destek ticket paneli mesajını gönderir.")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def ticketpanel(interaction: discord.Interaction):
+    if interaction.guild is None or not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message("Bu komut sadece bir metin kanalında kullanılabilir.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        description=(
+            "📩 **Need Help? Open a Ticket!**\n\n"
+            "If you have any **questions**, **issues**, or need **support**, our team is here to help you.\n\n"
+            "📩 Click the button below to **open a support ticket**.\n"
+            "Please **describe your issue clearly** so we can assist you as quickly as possible."
+        ),
+        color=discord.Color.blurple(),
+    )
+    await interaction.channel.send(embed=embed, view=TicketPanelView())
+    await interaction.response.send_message("✅ Ticket paneli gönderildi.", ephemeral=True)
+
+
 # Her guild + user için çalışan "gezdirme" görevlerini tutuyoruz
 # key: (guild_id, user_id) -> asyncio.Task
 gezdirme_gorevleri: dict[tuple[int, int], asyncio.Task] = {}
@@ -153,6 +275,18 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    # Bot'un kendisi sesten çıkarıldıysa (biri attıysa, bağlantı koptuysa vs.)
+    # kısa bir bekleme sonrası otomatik olarak sabit 7/24 ses kanalına geri döner.
+    if member.id == bot.user.id and before.channel is not None and after.channel is None:
+        async def _otomatik_geri_baglan(guild: discord.Guild):
+            await asyncio.sleep(2)
+            try:
+                await _sabit_ses_kanaline_baglan(guild, zorla_tasi=True)
+            except Exception as e:
+                print(f"7/24 ses kanalına otomatik geri bağlanma başarısız ({guild.name}): {e}")
+
+        bot.loop.create_task(_otomatik_geri_baglan(member.guild))
+
     key = (member.guild.id, member.id)
 
     # Godmode: biri kullanıcıyı başka kanala çekerse (gezdir, elle taşıma vs.)
@@ -212,6 +346,11 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 
 @bot.event
 async def on_ready():
+    # Ticket butonları bot yeniden başlasa bile çalışmaya devam etsin diye
+    # persistent view'ları burada (her başlangıçta) kaydediyoruz.
+    bot.add_view(TicketPanelView())
+    bot.add_view(TicketCloseView())
+
     try:
         synced = await bot.tree.sync()
         print(f"{len(synced)} slash komut global olarak senkronize edildi (yayılması ~1 saate kadar sürebilir).")
@@ -231,6 +370,11 @@ async def on_ready():
             await _uye_rolu_getir_veya_olustur(guild)
         except discord.HTTPException as e:
             print(f"'{UYE_ROLU_ADI}' rolü hazırlanamadı ({guild.name}): {e}")
+
+        try:
+            await _sabit_ses_kanaline_baglan(guild)
+        except Exception as e:
+            print(f"7/24 ses kanalına bağlanılamadı ({guild.name}): {e}")
 
     print(f"{bot.user} olarak giriş yapıldı.")
 
@@ -441,14 +585,20 @@ async def gezdir(interaction: discord.Interaction, user: discord.Member):
         )
         return
 
+    komutu_kullananin_kanali = None
+    if isinstance(interaction.user, discord.Member) and interaction.user.voice is not None:
+        komutu_kullananin_kanali = interaction.user.voice.channel
+
     kanallar = [
         vc for vc in interaction.guild.voice_channels
         if vc.permissions_for(interaction.guild.me).connect
+        and (komutu_kullananin_kanali is None or vc.id != komutu_kullananin_kanali.id)
     ]
 
     if len(kanallar) < 2:
         await interaction.response.send_message(
-            "Gezdirmek için en az 2 tane erişilebilir ses kanalı olmalı.", ephemeral=True
+            "Gezdirmek için (senin bulunduğun kanal hariç) en az 2 tane erişilebilir ses kanalı olmalı.",
+            ephemeral=True,
         )
         return
 
@@ -785,6 +935,35 @@ def _sira_al(guild_id: int) -> MuzikSirasi:
     return muzik_siralari.setdefault(guild_id, MuzikSirasi())
 
 
+# ============================================
+# 7/24 SESSİZ SES KANALINDA BEKLEME
+# ============================================
+# Bot, sunucudaki en üstteki (ilk) ses kanalına girer, kendini sessize alır
+# (self-mute + self-deaf) ve orada kalır. Biri onu atarsa/kanaldan çıkarsa
+# otomatik olarak geri bağlanır. Müzik çalınca oraya taşınır, müzik bitince
+# tekrar sabit kanala döner.
+async def _sabit_ses_kanaline_baglan(guild: discord.Guild, zorla_tasi: bool = False) -> None:
+    erisilebilir = sorted(
+        (vc for vc in guild.voice_channels if vc.permissions_for(guild.me).connect),
+        key=lambda c: c.position,
+    )
+    if not erisilebilir:
+        return
+
+    hedef = erisilebilir[0]
+    ses_client = discord.utils.get(bot.voice_clients, guild=guild)
+
+    try:
+        if ses_client is None or not ses_client.is_connected():
+            await hedef.connect(self_mute=True, self_deaf=True, reconnect=True)
+        elif ses_client.channel.id != hedef.id:
+            # Müzik çalıyorsa/duraklatılmışsa, zorla_tasi=True verilmediği sürece rahatsız etme.
+            if zorla_tasi or not (ses_client.is_playing() or ses_client.is_paused()):
+                await ses_client.move_to(hedef)
+    except discord.HTTPException as e:
+        print(f"Sabit ses kanalına bağlanılamadı ({guild.name}): {e}")
+
+
 def _sarki_ara(sorgu: str) -> dict:
     """Bloklayıcı yt-dlp aramasını çalıştırır (executor içinde çağrılmalı)."""
     with yt_dlp.YoutubeDL(YTDLP_AYARLARI) as ydl:
@@ -815,6 +994,11 @@ async def _sonrakini_cal(guild: discord.Guild):
 
     if not sira.kuyruk:
         sira.simdi_calan = None
+        # Çalınacak şarkı kalmadı, botu tekrar sabit 7/24 ses kanalına gönder.
+        try:
+            await _sabit_ses_kanaline_baglan(guild, zorla_tasi=True)
+        except Exception as e:
+            print(f"Müzik bitince sabit kanala dönülemedi ({guild.name}): {e}")
         return
 
     sonraki = sira.kuyruk.pop(0)
@@ -1074,6 +1258,7 @@ async def dur(interaction: discord.Interaction):
 @godmodedurdur.error
 @sil.error
 @kilitle.error
+@ticketpanel.error
 @play.error
 @skip.error
 @sira_goster.error
