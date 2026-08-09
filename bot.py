@@ -26,7 +26,22 @@ YTDLP_AYARLARI = {
     "no_warnings": True,
     "default_search": "ytsearch1",
     "source_address": "0.0.0.0",
+    # YouTube'un "Sign in to confirm you're not a bot" kontrolünü atlatmak için
+    # Android/web istemcisi gibi davranıyoruz. Garanti değil (YouTube sık değişiyor)
+    # ama datacenter IP'lerde (Railway vb.) en çok işe yarayan yöntem bu.
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android", "web"],
+        }
+    },
 }
+
+# Opsiyonel: bir cookies.txt dosyan varsa (Netscape formatında, YouTube'a giriş
+# yapılmış bir hesaptan export edilmiş), COOKIES_DOSYASI ortam değişkenine dosya
+# yolunu yazarsan otomatik kullanılır ve bot tespiti çok daha az tetiklenir.
+COOKIES_DOSYASI = os.getenv("COOKIES_DOSYASI", "")
+if COOKIES_DOSYASI and os.path.exists(COOKIES_DOSYASI):
+    YTDLP_AYARLARI["cookiefile"] = COOKIES_DOSYASI
 
 FFMPEG_SECENEKLERI = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
