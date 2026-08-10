@@ -152,6 +152,7 @@ def _varsayilan_veri() -> dict:
         "log_kanali": {},  # "guild_id" -> kanal_id
         "koruma": {},      # "guild_id" -> {"link": bool, "kufur": bool, "spam": bool, "yenihesap": bool}
         "cekilisler": {},  # "mesaj_id" -> çekiliş kaydı
+        "sabit_kanal": {}, # "guild_id" -> 7/24 sabit ses kanalı id'si
     }
 
 
@@ -1265,16 +1266,27 @@ def _sira_al(guild_id: int) -> MuzikSirasi:
 # Bot, sunucudaki en üstteki (ilk) ses kanalına girer, kendini sessize alır
 # (self-mute + self-deaf) ve orada kalır. Biri onu atarsa/kanaldan çıkarsa
 # otomatik olarak geri bağlanır. Müzik çalınca oraya taşınır, müzik bitince
-# tekrar sabit kanala döner.
+# tekrar sabit kanala döner. Kullanıcı /724aktif ile kanal belirlediyse o kanal,
+# belirlemediyse en üstteki ses kanalı kullanılır.
 async def _sabit_ses_kanaline_baglan(guild: discord.Guild, zorla_tasi: bool = False) -> None:
-    erisilebilir = sorted(
-        (vc for vc in guild.voice_channels if vc.permissions_for(guild.me).connect),
-        key=lambda c: c.position,
-    )
-    if not erisilebilir:
-        return
+    # 1) Kullanıcının /724aktif ile belirlediği kanal varsa onu kullan
+    hedef = None
+    ayar_id = _veri.get("sabit_kanal", {}).get(str(guild.id))
+    if ayar_id:
+        kanal = guild.get_channel(int(ayar_id))
+        if isinstance(kanal, discord.VoiceChannel) and kanal.permissions_for(guild.me).connect:
+            hedef = kanal
 
-    hedef = erisilebilir[0]
+    # 2) Yoksa en üstteki erişilebilir ses kanalına düş (eski davranış)
+    if hedef is None:
+        erisilebilir = sorted(
+            (vc for vc in guild.voice_channels if vc.permissions_for(guild.me).connect),
+            key=lambda c: c.position,
+        )
+        if not erisilebilir:
+            return
+        hedef = erisilebilir[0]
+
     ses_client = discord.utils.get(bot.voice_clients, guild=guild)
 
     try:
@@ -1565,6 +1577,33 @@ async def dur(interaction: discord.Interaction):
     await ses_client.disconnect()
 
     await interaction.response.send_message("⏹️ Müzik durduruldu, kuyruk temizlendi, ses kanalından ayrıldım.")
+
+
+@bot.tree.command(name="724aktif", description="Bulunduğun ses kanalını 7/24 sabit kanal yapar, botu oraya gönderir.")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def yedi_yirmi_dort_aktif(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Bu komut sadece sunucuda kullanılabilir.", ephemeral=True)
+        return
+
+    if not isinstance(interaction.user, discord.Member) or interaction.user.voice is None or interaction.user.voice.channel is None:
+        await interaction.response.send_message("Önce bir ses kanalına girmen lazım.", ephemeral=True)
+        return
+
+    kanal = interaction.user.voice.channel
+    _veri["sabit_kanal"][str(interaction.guild.id)] = str(kanal.id)
+    _veri_kaydet()
+
+    try:
+        await _sabit_ses_kanaline_baglan(interaction.guild, zorla_tasi=True)
+    except Exception as e:
+        await interaction.response.send_message(f"Kanal kaydedildi ama bağlanılamadı: {e}", ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        f"✅ **{kanal.name}** artık 7/24 sabit kanal. Bot orada bekleyecek, "
+        f"müzik bitince hep buraya dönecek."
+    )
 
 
 # ============================================
@@ -2042,6 +2081,7 @@ async def cekilis(interaction: discord.Interaction, odul: str, sure_dk: int, kaz
 @duraklat.error
 @devam.error
 @dur.error
+@yedi_yirmi_dort_aktif.error
 @uyari.error
 @uyarilar.error
 @uyarisil.error
