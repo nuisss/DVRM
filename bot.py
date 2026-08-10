@@ -18,6 +18,9 @@ import yt_dlp
 # ============================================
 TOKEN = os.getenv("DISCORD_TOKEN", "BOT_TOKENINI_BURAYA_YAZ")
 
+# Bot'un başlangıç zamanı (/botbilgi için)
+BASLANGIC_ZAMANI = time.time()
+
 # Windows'ta ffmpeg.exe PATH'te değilse buraya tam yolunu yazabilirsin,
 # örn: r"C:\ffmpeg\bin\ffmpeg.exe"
 FFMPEG_YOLU = "ffmpeg"
@@ -153,6 +156,7 @@ def _varsayilan_veri() -> dict:
         "koruma": {},      # "guild_id" -> {"link": bool, "kufur": bool, "spam": bool, "yenihesap": bool}
         "cekilisler": {},  # "mesaj_id" -> çekiliş kaydı
         "sabit_kanal": {}, # "guild_id" -> 7/24 sabit ses kanalı id'si
+        "sayac": {},      # "guild_id" -> {"uye": {"kanal_id","ad"}, "ses": {...}}
     }
 
 
@@ -254,9 +258,31 @@ async def ses_xp_dongusu():
         _veri_kaydet()
 
 
-# ============================================
-# ANTI-SPAM / ANTI-LINK KORUMASI
-# ============================================
+async def _sayac_kanali_guncelle(kanal: discord.VoiceChannel, tur: str):
+    """Bir sayaç kanalının adını anlık üye/ses sayısına göre günceller."""
+    if tur == "uye":
+        isim = f"👥 Üye: {kanal.guild.member_count or 0}"
+    else:
+        isim = f"🎧 Seste: {sum(len(vc.members) for vc in kanal.guild.voice_channels)}"
+    if kanal.name != isim:
+        try:
+            await kanal.edit(name=isim)
+        except discord.HTTPException:
+            pass
+
+
+async def sayac_dongusu():
+    """Her 60 saniyede bir, ayarlanmış sayaç kanallarını günceller."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        await asyncio.sleep(60)
+        for guild in bot.guilds:
+            sayaclar = _veri.get("sayac", {}).get(str(guild.id), {})
+            for tur, kayit in list(sayaclar.items()):
+                kanal = guild.get_channel(int(kayit["kanal_id"]))
+                if kanal is None or not isinstance(kanal, discord.VoiceChannel):
+                    continue
+                await _sayac_kanali_guncelle(kanal, tur)
 INVITE_DESENI = re.compile(r"discord(?:\.gg|\.com/invite|app\.com/invite)/[A-Za-z0-9_-]+")
 
 KUFUR_KELIMELERI = [
@@ -646,10 +672,11 @@ async def on_ready():
             print(f"Çekiliş view'ı eklenemedi ({mid_str}): {e}")
         cekilis_gorevleri[int(mid_str)] = bot.loop.create_task(_cekilis_sayaci(int(mid_str)))
 
-    # Ses XP döngüsünü bir kez başlat (reconnect'lerde tekrar başlatma)
+    # Ses XP + sayaç döngülerini bir kez başlat (reconnect'lerde tekrar başlatma)
     if not getattr(bot, "_ses_xp_basladi", False):
         bot._ses_xp_basladi = True
         bot.loop.create_task(ses_xp_dongusu())
+        bot.loop.create_task(sayac_dongusu())
 
     try:
         synced = await bot.tree.sync()
@@ -2055,6 +2082,691 @@ async def cekilis(interaction: discord.Interaction, odul: str, sure_dk: int, kaz
 
 
 # ============================================
+# SUNUCU KURULUM SİHİRBAZI (/sunucukur)
+# ============================================
+# "Geniş" kanal şablonu: her kanal için toggle butonu olan bir anket gösterilir,
+# seçilmeyen kanallar + şablonda olmayan eski kanallar silinir (ticket hariç).
+KANAL_SABLONU = {
+    "SOHBET": [
+        ("kurallar", "metin"),
+        ("duyurular", "metin"),
+        ("genel-sohbet", "metin"),
+        ("oyun-sohbet", "metin"),
+        ("medya", "metin"),
+        ("bot-komutlari", "metin"),
+        ("cekilisler", "metin"),
+        ("yardim", "metin"),
+    ],
+    "SES": [
+        ("genel", "ses"),
+        ("oyun", "ses"),
+        ("muzik", "ses"),
+    ],
+    "YONETIM": [
+        ("yonetim", "metin"),
+    ],
+}
+
+# YÖNETİM kanalını görebilecek rol adları (/rolayarla ile kurulanlar)
+MODERATOR_ROL_ADLARI = ["Kurucu", "Yönetici", "Moderatör", "Yardımcı"]
+
+
+def _sablon_kanal_adlari() -> set[str]:
+    return {ad for kanallar in KANAL_SABLONU.values() for ad, _ in kanallar}
+
+
+class OnayView(discord.ui.View):
+    """İki butonlu basit onay ekranı (Evet / Vazgeç)."""
+
+    def __init__(self, onayla, vazgec, etiket: str = "✅ Onayla"):
+        super().__init__(timeout=120)
+        evet = discord.ui.Button(label=etiket, style=discord.ButtonStyle.success, row=0)
+        evet.callback = onayla
+        hayir = discord.ui.Button(label="❌ Vazgeç", style=discord.ButtonStyle.secondary, row=0)
+        hayir.callback = vazgec
+        self.add_item(evet)
+        self.add_item(hayir)
+
+
+class SunucuKurView(discord.ui.View):
+    """Kanal şablonu anketi: her kanal için aç/kapat butonu + Kur butonu."""
+
+    def __init__(self, embed: discord.Embed):
+        super().__init__(timeout=600)
+        self.embed = embed
+        self.secimler = {ad: True for ad in _sablon_kanal_adlari()}
+        self.butonlar: dict[str, discord.ui.Button] = {}
+
+        for satir, ad in enumerate(_sablon_kanal_adlari()):
+            buton = discord.ui.Button(
+                label=f"✅ #{ad}",
+                style=discord.ButtonStyle.success,
+                row=satir % 5,
+            )
+            buton.callback = lambda inter, a=ad: self._secim_degistir(inter, a)
+            self.butonlar[ad] = buton
+            self.add_item(buton)
+
+        kur = discord.ui.Button(label="⚙️ Kur", style=discord.ButtonStyle.danger, row=4)
+        kur.callback = self._kur_onay
+        self.add_item(kur)
+
+    async def _secim_degistir(self, interaction: discord.Interaction, ad: str):
+        self.secimler[ad] = not self.secimler[ad]
+        buton = self.butonlar[ad]
+        if self.secimler[ad]:
+            buton.label = f"✅ #{ad}"
+            buton.style = discord.ButtonStyle.success
+        else:
+            buton.label = f"⬜ #{ad}"
+            buton.style = discord.ButtonStyle.secondary
+        await interaction.response.edit_message(view=self)
+
+    async def _kur_onay(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        secilen = {ad for ad, sec in self.secimler.items() if sec}
+        silinecek = 0
+        for kanal in guild.channels:
+            if isinstance(kanal, discord.CategoryChannel):
+                if kanal.name != TICKET_KATEGORI_ADI and kanal.name not in KANAL_SABLONU:
+                    silinecek += 1
+            elif kanal.name.startswith(TICKET_KANAL_ON_EK):
+                continue
+            elif kanal.name not in secilen:
+                silinecek += 1
+
+        embed = discord.Embed(
+            title="⚠️ Onay Gerekli",
+            description=(
+                f"**{len(secilen)} kanal** kurulacak, **{silinecek} kanal** silinecek.\n\n"
+                f"Ticket kanalları (ticket-*) korunur. Onaylıyor musun?"
+            ),
+            color=discord.Color.orange(),
+        )
+        onay = OnayView(
+            onayla=self._kur_uygula,
+            vazgec=self._vazgec,
+            etiket="✅ Onayla ve Kur",
+        )
+        await interaction.response.edit_message(embed=embed, view=onay)
+
+    async def _vazgec(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(embed=self.embed, view=SunucuKurView(self.embed))
+
+    async def _kur_uygula(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        secilen = {ad for ad, sec in self.secimler.items() if sec}
+        sonuc = await _sunucu_kur(interaction.guild, secilen)
+        await interaction.followup.edit_message(interaction.message.id, content=sonuc, embed=None, view=None)
+
+
+async def _sunucu_kur(guild: discord.Guild, secilen: set[str]) -> str:
+    """Seçilen kanalları kurar, seçilmeyenleri ve şablon dışı kanalları siler."""
+    kurulan = 0
+    silinen = 0
+    mod_rolleri = [r for r in guild.roles if r.name in MODERATOR_ROL_ADLARI]
+
+    # 1) Fazla kanalları sil (ticket korunur)
+    for kanal in list(guild.channels):
+        try:
+            if isinstance(kanal, discord.CategoryChannel):
+                if kanal.name == TICKET_KATEGORI_ADI or kanal.name in KANAL_SABLONU:
+                    continue
+                await kanal.delete(reason="/sunucukur - şablon temizliği")
+                silinen += 1
+            elif kanal.name.startswith(TICKET_KANAL_ON_EK):
+                continue
+            elif kanal.name in secilen:
+                continue
+            else:
+                await kanal.delete(reason="/sunucukur - şablon temizliği")
+                silinen += 1
+        except discord.HTTPException:
+            pass
+
+    # 2) Kategorileri ve seçilen kanalları oluştur
+    for kategori_adi, kanallar in KANAL_SABLONU.items():
+        kategori = discord.utils.get(guild.categories, name=kategori_adi)
+        if kategori is None:
+            try:
+                kategori = await guild.create_category(kategori_adi, reason="/sunucukur - şablon")
+            except discord.HTTPException:
+                kategori = None
+
+        for kanal_adi, tur in kanallar:
+            if kanal_adi not in secilen:
+                continue
+            if discord.utils.get(guild.channels, name=kanal_adi) is not None:
+                continue
+
+            overwrites = None
+            # kurallar / duyurular sadece okunabilir olsun (yazmak için yetkili rol gerek)
+            if kanal_adi in ("kurallar", "duyurular"):
+                overwrites = {
+                    guild.default_role: discord.PermissionOverwrite(
+                        view_channel=True, read_message_history=True, send_messages=False
+                    ),
+                    guild.me: discord.PermissionOverwrite(send_messages=True, read_message_history=True),
+                }
+                for rol in mod_rolleri:
+                    overwrites[rol] = discord.PermissionOverwrite(send_messages=True, read_message_history=True)
+
+            try:
+                if tur == "ses":
+                    await guild.create_voice_channel(kanal_adi, category=kategori, reason="/sunucukur")
+                else:
+                    await guild.create_text_channel(
+                        kanal_adi, category=kategori, overwrites=overwrites, reason="/sunucukur"
+                    )
+                kurulan += 1
+            except discord.HTTPException:
+                pass
+
+    # 3) YÖNETİM kanalını sadece yetkili rollerine aç (@everyone kapalı)
+    yonetim = discord.utils.get(guild.categories, name="YONETIM")
+    if yonetim is not None:
+        yonetim_izinleri = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            guild.me: discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, read_message_history=True
+            ),
+        }
+        for rol in mod_rolleri:
+            yonetim_izinleri[rol] = discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, read_message_history=True
+            )
+        try:
+            await yonetim.edit(overwrites=yonetim_izinleri)
+        except discord.HTTPException:
+            pass
+
+    return f"✅ **Sunucu kurulumu tamamlandı:** {kurulan} kanal kuruldu, {silinen} kanal silindi."
+
+
+@bot.tree.command(name="sunucukur", description="Kanal şablonunu anket ile kurar (seçilmeyen kanalları siler!).")
+@app_commands.checks.has_permissions(administrator=True)
+async def sunucukur(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Bu komut sadece sunucuda kullanılabilir.", ephemeral=True)
+        return
+
+    satirlar = []
+    for kategori_adi, kanallar in KANAL_SABLONU.items():
+        satirlar.append(f"**{kategori_adi}**")
+        for ad, tur in kanallar:
+            satirlar.append(f"- {'🎧' if tur == 'ses' else '#️⃣'} {ad}")
+        satirlar.append("")
+    embed = discord.Embed(
+        title="🏗️ Sunucu Kurulum Şablonu",
+        description=(
+            "Aşağıdaki kanalların hangilerinin kurulacağını seç.\n"
+            "**Seçmediğin kanallar ve şablonda olmayan eski kanallar silinir** "
+            "(ticket-* kanalları korunur).\n\n" + "\n".join(satirlar)
+        ),
+        color=discord.Color.blurple(),
+    )
+    await interaction.response.send_message(embed=embed, view=SunucuKurView(embed))
+
+
+# ============================================
+# ROL KURULUM SİHİRBAZI (/rolayarla)
+# ============================================
+ROL_SABLONU = [
+    {
+        "anahtar": "kurucu",
+        "varsayilan": "Kurucu",
+        "renk": 0xE74C3C,
+        "aciklama": "Tam yetki (administrator)",
+        "izinler": discord.Permissions(administrator=True),
+    },
+    {
+        "anahtar": "yonetici",
+        "varsayilan": "Yönetici",
+        "renk": 0xE74C3C,
+        "aciklama": "Tam yetki (administrator)",
+        "izinler": discord.Permissions(administrator=True),
+    },
+    {
+        "anahtar": "moderator",
+        "varsayilan": "Moderatör",
+        "renk": 0xE67E22,
+        "aciklama": "Kick/ban/mesaj ve ses moderasyonu",
+        "izinler": discord.Permissions(
+            kick_members=True,
+            ban_members=True,
+            manage_messages=True,
+            mute_members=True,
+            deafen_members=True,
+            move_members=True,
+            manage_nicknames=True,
+            moderate_members=True,
+        ),
+    },
+    {
+        "anahtar": "yardimci",
+        "varsayilan": "Yardımcı",
+        "renk": 0x3498DB,
+        "aciklama": "Mesaj/ses moderasyonu (ban/kick yok)",
+        "izinler": discord.Permissions(
+            manage_messages=True,
+            mute_members=True,
+            deafen_members=True,
+            move_members=True,
+            manage_nicknames=True,
+            moderate_members=True,
+        ),
+    },
+]
+
+
+class RolIsimModal(discord.ui.Modal, title="Rol Adını Değiştir"):
+    def __init__(self, anahtar: str, varsayilan_isim: str, kaydet):
+        super().__init__()
+        self.anahtar = anahtar
+        self.kaydet = kaydet
+        self.isim_giris = discord.ui.TextInput(
+            label="Yeni rol adı",
+            default=varsayilan_isim,
+            max_length=100,
+        )
+        self.add_item(self.isim_giris)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await self.kaydet(interaction, self.anahtar, self.isim_giris.value.strip())
+
+
+class RolAyarlaView(discord.ui.View):
+    """Rol şablonu anketi: her rol için aç/kapat + isim değiştir + Kur butonu."""
+
+    def __init__(self, embed: discord.Embed):
+        super().__init__(timeout=600)
+        self.embed = embed
+        self.secimler = {r["anahtar"]: True for r in ROL_SABLONU}
+        self.isimler: dict[str, str] = {}
+        self.butonlar: dict[str, discord.ui.Button] = {}
+        self.isim_butonlari: dict[str, discord.ui.Button] = {}
+
+        for satir, sablon in enumerate(ROL_SABLONU):
+            anahtar = sablon["anahtar"]
+            secim_buton = discord.ui.Button(
+                label=f"✅ {sablon['varsayilan']}",
+                style=discord.ButtonStyle.success,
+                row=satir,
+            )
+            secim_buton.callback = lambda inter, a=anahtar: self._secim(inter, a)
+            self.butonlar[anahtar] = secim_buton
+            self.add_item(secim_buton)
+
+            isim_buton = discord.ui.Button(
+                label=f"✏️ {sablon['varsayilan']}",
+                style=discord.ButtonStyle.secondary,
+                row=satir,
+            )
+            isim_buton.callback = lambda inter, a=anahtar: self._isim_degistir(inter, a)
+            self.isim_butonlari[anahtar] = isim_buton
+            self.add_item(isim_buton)
+
+        kur = discord.ui.Button(label="⚙️ Kur", style=discord.ButtonStyle.danger, row=4)
+        kur.callback = self._kur_onay
+        self.add_item(kur)
+
+    def _gorunen_isim(self, anahtar: str) -> str:
+        sablon = next(r for r in ROL_SABLONU if r["anahtar"] == anahtar)
+        return self.isimler.get(anahtar, sablon["varsayilan"])
+
+    async def _secim(self, interaction: discord.Interaction, anahtar: str):
+        self.secimler[anahtar] = not self.secimler[anahtar]
+        buton = self.butonlar[anahtar]
+        if self.secimler[anahtar]:
+            buton.label = f"✅ {self._gorunen_isim(anahtar)}"
+            buton.style = discord.ButtonStyle.success
+        else:
+            buton.label = f"⬜ {self._gorunen_isim(anahtar)}"
+            buton.style = discord.ButtonStyle.secondary
+        await interaction.response.edit_message(view=self)
+
+    async def _isim_degistir(self, interaction: discord.Interaction, anahtar: str):
+        await interaction.response.send_modal(RolIsimModal(anahtar, self._gorunen_isim(anahtar), self._isim_kaydet))
+
+    async def _isim_kaydet(self, interaction: discord.Interaction, anahtar: str, yeni_isim: str):
+        if not yeni_isim:
+            await interaction.response.send_message("İsim boş olamaz.", ephemeral=True)
+            return
+        self.isimler[anahtar] = yeni_isim
+        sablon = next(r for r in ROL_SABLONU if r["anahtar"] == anahtar)
+        # Görünür isimde üstü çizili değil; kullanıcıya onay mesajı + buton label güncelle
+        self.butonlar[anahtar].label = f"✅ {yeni_isim}"
+        self.isim_butonlari[anahtar].label = f"✏️ {yeni_isim}"
+        await interaction.response.edit_message(view=self)
+
+    async def _kur_onay(self, interaction: discord.Interaction):
+        secilen = [r["anahtar"] for r in ROL_SABLONU if self.secimler.get(r["anahtar"])]
+        mevcut_rol_sayisi = sum(
+            1 for r in interaction.guild.roles if not r.is_default() and r.id not in {mr.id for mr in interaction.guild.me.roles}
+        )
+        embed = discord.Embed(
+            title="⚠️ Onay Gerekli",
+            description=(
+                f"**{len(secilen)} rol** kurulacak.\n"
+                f"**{mevcut_rol_sayisi} mevcut rol** silinecek (bot rollerine dokunulmaz). "
+                f"Üyelerin rolleri gidebilir!\n\nOnaylıyor musun?"
+            ),
+            color=discord.Color.orange(),
+        )
+        onay = OnayView(
+            onayla=self._kur_uygula,
+            vazgec=self._vazgec,
+            etiket="✅ Onayla ve Rolleri Kur",
+        )
+        await interaction.response.edit_message(embed=embed, view=onay)
+
+    async def _vazgec(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(embed=self.embed, view=RolAyarlaView(self.embed))
+
+    async def _kur_uygula(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        secilen = {r["anahtar"] for r in ROL_SABLONU if self.secimler.get(r["anahtar"])}
+        kurulan, silinen = await _rolleri_kur(interaction.guild, secilen, self.isimler)
+        sonuc = f"✅ **Rol kurulumu tamamlandı:** {kurulan} rol kuruldu, {silinen} rol silindi."
+        await interaction.followup.edit_message(interaction.message.id, content=sonuc, embed=None, view=None)
+
+
+async def _rolleri_kur(guild: discord.Guild, secilen: set[str], isimler: dict[str, str]) -> tuple[int, int]:
+    """Mevcut rolleri (bot rollerinin dışında) siler, seçilen şablon rolleri oluşturur."""
+    korunacak_idler = {rol.id for rol in guild.me.roles}
+    silinen = 0
+    for rol in list(guild.roles):
+        if rol.is_default() or rol.id in korunacak_idler:
+            continue
+        try:
+            await rol.delete(reason="/rolayarla - şablon kurulumu")
+            silinen += 1
+        except discord.HTTPException:
+            pass
+
+    kurulan = 0
+    for sablon in ROL_SABLONU:
+        anahtar = sablon["anahtar"]
+        if anahtar not in secilen:
+            continue
+        isim = isimler.get(anahtar, sablon["varsayilan"])
+        try:
+            rol = await guild.create_role(
+                name=isim,
+                color=discord.Color(sablon["renk"]),
+                permissions=sablon["izinler"],
+                hoist=True,
+                reason="/rolayarla - şablon",
+            )
+            kurulan += 1
+            if anahtar == "kurucu" and guild.owner is not None:
+                try:
+                    await guild.owner.add_roles(rol, reason="kurucu rolü ataması")
+                except discord.HTTPException:
+                    pass
+        except discord.HTTPException:
+            pass
+
+    return kurulan, silinen
+
+
+@bot.tree.command(name="rolayarla", description="Rol şablonunu kurar (mevcut rolleri siler, isim değiştirilebilir!).")
+@app_commands.checks.has_permissions(administrator=True)
+async def rolayarla(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Bu komut sadece sunucuda kullanılabilir.", ephemeral=True)
+        return
+
+    satirlar = []
+    for sablon in ROL_SABLONU:
+        satirlar.append(f"- **{sablon['varsayilan']}** — {sablon['aciklama']}")
+    embed = discord.Embed(
+        title="🎖️ Rol Kurulum Şablonu",
+        description=(
+            "Kurulacak rolleri seç, istediğin rolün adını ✏️ ile değiştir.\n"
+            "**Kur'a bastığında mevcut roller silinir** (bot rollerine dokunulmaz, "
+            "sahip 'Kurucu' rolünü otomatik alır).\n\n" + "\n".join(satirlar)
+        ),
+        color=discord.Color.blurple(),
+    )
+    await interaction.response.send_message(embed=embed, view=RolAyarlaView(embed))
+
+
+# ============================================
+# TIMEOUT KOMUTLARI (/sustur)
+# ============================================
+
+@bot.tree.command(name="sustur", description="Kullanıcıya süreli timeout uygular (otomatik kalkar).")
+@app_commands.describe(user="Susturulacak kullanıcı", sure="Süre (dakika, max 40320 = 28 gün)")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def sustur(interaction: discord.Interaction, user: discord.Member, sure: app_commands.Range[int, 1, 40320]):
+    if interaction.guild is None:
+        await interaction.response.send_message("Bu komut sadece sunucuda kullanılabilir.", ephemeral=True)
+        return
+
+    if not interaction.guild.me.guild_permissions.moderate_members:
+        await interaction.response.send_message("Botun 'Üyeleri Zaman Aşımına Uğrat' iznine ihtiyacım var.", ephemeral=True)
+        return
+    if user.top_role >= interaction.guild.me.top_role:
+        await interaction.response.send_message(
+            f"{user.mention} kullanıcısının rolü benimkinden yüksek/eşit, susturamam.", ephemeral=True
+        )
+        return
+    if user.timed_out_until is not None:
+        await interaction.response.send_message(f"{user.mention} zaten susturulmuş.", ephemeral=True)
+        return
+
+    bitis = discord.utils.utcnow() + datetime.timedelta(minutes=sure)
+    try:
+        await user.timeout(bitis, reason=f"{interaction.user} tarafından /sustur")
+    except discord.HTTPException as e:
+        await interaction.response.send_message(f"Uygulanamadı: {e}", ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        f"🤐 {user.mention} **{sure} dakika** susturuldu. Bitiş: <t:{int(bitis.timestamp())}:R>"
+    )
+    await _log_gonder(
+        interaction.guild,
+        "🤐 Timeout",
+        f"{user.mention} **{sure} dakika** susturuldu.\nBitiş: <t:{int(bitis.timestamp())}:R>\nYetkili: {interaction.user.mention}",
+        discord.Color.orange(),
+    )
+
+
+@bot.tree.command(name="susturkaldir", description="Kullanıcının timeout'unu kaldırır.")
+@app_commands.describe(user="Timeout'u kaldırılacak kullanıcı")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def susturkaldir(interaction: discord.Interaction, user: discord.Member):
+    if interaction.guild is None:
+        await interaction.response.send_message("Bu komut sadece sunucuda kullanılabilir.", ephemeral=True)
+        return
+
+    if user.timed_out_until is None:
+        await interaction.response.send_message(f"{user.mention} zaten susturulmuş değil.", ephemeral=True)
+        return
+
+    try:
+        await user.timeout(None, reason=f"{interaction.user} tarafından /susturkaldir")
+    except discord.HTTPException as e:
+        await interaction.response.send_message(f"Kaldırılamadı: {e}", ephemeral=True)
+        return
+
+    await interaction.response.send_message(f"✅ {user.mention} timeout'u kaldırıldı.")
+
+
+# ============================================
+# HATIRLATICI / ANKET / RAPOR / SAYAÇ / PING
+# ============================================
+
+@bot.tree.command(name="hatirlat", description="Belirli süre sonra sana DM'den hatırlatma gönderir.")
+@app_commands.describe(dakika="Kaç dakika sonra", mesaj="Hatırlatma mesajı")
+async def hatirlat(interaction: discord.Interaction, dakika: int, mesaj: str):
+    if interaction.guild is None:
+        await interaction.response.send_message("Bu komut sadece sunucuda kullanılabilir.", ephemeral=True)
+        return
+
+    if dakika < 1:
+        dakika = 1
+
+    await interaction.response.send_message(
+        f"⏰ **{dakika} dakika** sonra hatırlatılacak: *{mesaj}*", ephemeral=True
+    )
+    await asyncio.sleep(dakika * 60)
+    try:
+        await interaction.user.send(f"⏰ **Hatırlatma:** {mesaj}")
+    except discord.HTTPException:
+        pass
+
+
+class AnketView(discord.ui.View):
+    """Butonlu oylama: her seçenek için bir buton, oy verince canlı sonuç güncellenir."""
+
+    def __init__(self, soru: str, secenekler: list[str]):
+        super().__init__(timeout=600)
+        self.soru = soru
+        self.secenekler = secenekler
+        self.oylar: dict[int, set[int]] = {i: set() for i in range(len(secenekler))}
+        emojiler = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
+        for i, sec in enumerate(secenekler):
+            buton = discord.ui.Button(
+                label=sec, emoji=emojiler[i], style=discord.ButtonStyle.primary, row=i % 5
+            )
+            buton.callback = lambda inter, i=i: self._oy(inter, i)
+            self.add_item(buton)
+
+    async def _oy(self, interaction: discord.Interaction, secim_index: int):
+        uid = interaction.user.id
+        for i in range(len(self.secenekler)):
+            self.oylar[i].discard(uid)
+        self.oylar[secim_index].add(uid)
+        await self._embed_guncelle(interaction)
+        await interaction.response.send_message(
+            f"✅ Oyun kaydedildi: **{self.secenekler[secim_index]}**", ephemeral=True
+        )
+
+    async def _embed_guncelle(self, interaction: discord.Interaction):
+        embed = interaction.message.embeds[0]
+        for i, sec in enumerate(self.secenekler):
+            embed.set_field_at(i, name=f"{i + 1}. {sec}", value=f"✅ {len(self.oylar[i])} oy", inline=True)
+        await interaction.message.edit(embed=embed)
+
+
+@bot.tree.command(name="anket", description="Butonlu oylama başlatır (seçenekleri virgülle ayır).")
+@app_commands.describe(soru="Anket sorusu", secenekler="Seçenekler (virgülle ayır, en fazla 5)")
+async def anket(interaction: discord.Interaction, soru: str, secenekler: str):
+    if interaction.guild is None:
+        await interaction.response.send_message("Bu komut sadece sunucuda kullanılabilir.", ephemeral=True)
+        return
+
+    secenek_listesi = [s.strip() for s in secenekler.split(",") if s.strip()][:5]
+    if len(secenek_listesi) < 2:
+        await interaction.response.send_message("En az 2 seçenek girmelisin (virgülle ayır).", ephemeral=True)
+        return
+
+    embed = discord.Embed(title="📊 Anket", description=soru, color=discord.Color.blurple())
+    for i, sec in enumerate(secenek_listesi, start=1):
+        embed.add_field(name=f"{i}. {sec}", value="✅ 0 oy", inline=True)
+    embed.set_footer(text=f"{interaction.user.display_name} tarafından başlatıldı")
+    await interaction.response.send_message(embed=embed, view=AnketView(soru, secenek_listesi))
+
+
+@bot.tree.command(name="rapor", description="Bir kullanıcıyı yetkili kanalına anonim olarak bildirir.")
+@app_commands.describe(user="Bildirilecek kullanıcı", sebep="Şikayet sebebi")
+async def rapor(interaction: discord.Interaction, user: discord.Member, sebep: str):
+    if interaction.guild is None:
+        await interaction.response.send_message("Bu komut sadece sunucuda kullanılabilir.", ephemeral=True)
+        return
+
+    if user == interaction.user:
+        await interaction.response.send_message("Kendini bildiremezsin.", ephemeral=True)
+        return
+
+    kanal_id = _veri["log_kanali"].get(str(interaction.guild.id))
+    if not kanal_id:
+        await interaction.response.send_message(
+            "Yetkililerin önce `/logkanali` komutuyla bir log kanalı ayarlaması lazım.", ephemeral=True
+        )
+        return
+    kanal = interaction.guild.get_channel(int(kanal_id))
+    if kanal is None or not isinstance(kanal, discord.TextChannel):
+        await interaction.response.send_message("Log kanalı bulunamadı.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="🚨 Yeni Rapor",
+        description=f"Hedef: {user.mention}\nSebep: **{sebep}**",
+        color=discord.Color.red(),
+    )
+    embed.set_footer(text="Anonim rapor — bildiren kişi gösterilmez.")
+    await kanal.send(embed=embed)
+    await interaction.response.send_message("✅ Raporun yetkili ekibe iletildi.", ephemeral=True)
+
+
+@bot.tree.command(name="sayac", description="Bir ses kanalını üye veya ses sayaç kanalı yapar.")
+@app_commands.describe(tur="Sayaç türü: uye veya ses", kanal="Sayaç olarak kullanılacak ses kanalı")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def sayac(interaction: discord.Interaction, tur: str, kanal: discord.VoiceChannel):
+    if interaction.guild is None:
+        await interaction.response.send_message("Bu komut sadece sunucuda kullanılabilir.", ephemeral=True)
+        return
+
+    if tur not in ("uye", "ses"):
+        await interaction.response.send_message("Geçerli türler: `uye` veya `ses`.", ephemeral=True)
+        return
+
+    sayaclar = _veri["sayac"].setdefault(str(interaction.guild.id), {})
+    sayaclar[tur] = {"kanal_id": str(kanal.id), "ad": kanal.name}
+    _veri_kaydet()
+    await _sayac_kanali_guncelle(kanal, tur)
+
+    tur_metni = "üye sayacı" if tur == "uye" else "ses sayacı"
+    await interaction.response.send_message(f"✅ **{kanal.name}** artık {tur_metni} (60 sn'de bir güncellenir).")
+
+
+@bot.tree.command(name="sayackapat", description="Ayarlanmış bir sayaç kanalını kapatır.")
+@app_commands.describe(tur="Kapatılacak sayaç türü: uye veya ses")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def sayackapat(interaction: discord.Interaction, tur: str):
+    if interaction.guild is None:
+        await interaction.response.send_message("Bu komut sadece sunucuda kullanılabilir.", ephemeral=True)
+        return
+
+    if tur not in ("uye", "ses"):
+        await interaction.response.send_message("Geçerli türler: `uye` veya `ses`.", ephemeral=True)
+        return
+
+    sayaclar = _veri["sayac"].setdefault(str(interaction.guild.id), {})
+    if tur not in sayaclar:
+        await interaction.response.send_message("Bu türde ayarlanmış bir sayaç yok.", ephemeral=True)
+        return
+
+    del sayaclar[tur]
+    _veri_kaydet()
+    await interaction.response.send_message(f"✅ {tur} sayacı kapatıldı.")
+
+
+@bot.tree.command(name="ping", description="Bot gecikmesini gösterir.")
+async def ping(interaction: discord.Interaction):
+    await interaction.response.send_message(f"🏓 Pong! Gecikme: **{round(bot.latency * 1000)}ms**")
+
+
+@bot.tree.command(name="botbilgi", description="Bot hakkında bilgi gösterir.")
+async def botbilgi(interaction: discord.Interaction):
+    komut_sayisi = len(bot.tree.get_commands())
+    calisma_suresi = int(time.time() - BASLANGIC_ZAMANI)
+    saat = calisma_suresi // 3600
+    dk = (calisma_suresi % 3600) // 60
+
+    embed = discord.Embed(title=f"{bot.user} — Bot Bilgisi", color=discord.Color.blurple())
+    embed.add_field(name="🏓 Gecikme", value=f"{round(bot.latency * 1000)}ms", inline=True)
+    embed.add_field(name="🖥️ Sunucu sayısı", value=str(len(bot.guilds)), inline=True)
+    embed.add_field(name="📜 Komut sayısı", value=str(komut_sayisi), inline=True)
+    embed.add_field(name="⏱️ Çalışma süresi", value=f"{saat} saat {dk} dk", inline=True)
+    await interaction.response.send_message(embed=embed)
+
+
+# ============================================
 # KOMUT HATA YAKALAYICI
 # ============================================
 
@@ -2093,6 +2805,17 @@ async def cekilis(interaction: discord.Interaction, odul: str, sure_dk: int, kaz
 @cekilis.error
 @level.error
 @liderlik.error
+@sunucukur.error
+@rolayarla.error
+@sustur.error
+@susturkaldir.error
+@hatirlat.error
+@anket.error
+@rapor.error
+@sayac.error
+@sayackapat.error
+@ping.error
+@botbilgi.error
 async def komut_hata(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message(
