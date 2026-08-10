@@ -2084,8 +2084,8 @@ async def cekilis(interaction: discord.Interaction, odul: str, sure_dk: int, kaz
 # ============================================
 # SUNUCU KURULUM SİHİRBAZI (/sunucukur)
 # ============================================
-# "Geniş" kanal şablonu: her kanal için toggle butonu olan bir anket gösterilir,
-# seçilmeyen kanallar + şablonda olmayan eski kanallar silinir (ticket hariç).
+# Kanal şablonu: dropdown'larla mevcut kanalların hangilerinin kalacağı seçtirilir,
+# seçilmeyen kanallar silinir, şablondaki eksik kanallar kurulur (ticket hariç).
 KANAL_SABLONU = {
     "SOHBET": [
         ("kurallar", "metin"),
@@ -2111,10 +2111,6 @@ KANAL_SABLONU = {
 MODERATOR_ROL_ADLARI = ["Kurucu", "Yönetici", "Moderatör", "Yardımcı"]
 
 
-def _sablon_kanal_adlari() -> set[str]:
-    return {ad for kanallar in KANAL_SABLONU.values() for ad, _ in kanallar}
-
-
 class OnayView(discord.ui.View):
     """İki butonlu basit onay ekranı (Evet / Vazgeç)."""
 
@@ -2129,56 +2125,75 @@ class OnayView(discord.ui.View):
 
 
 class SunucuKurView(discord.ui.View):
-    """Kanal şablonu anketi: her kanal için aç/kapat butonu + Kur butonu."""
+    """Mevcut kanalları + şablon eksiklerini dropdown'larla seçtirir; seçilmeyenleri siler."""
 
-    def __init__(self, embed: discord.Embed):
+    def __init__(self, embed: discord.Embed, gruplar: list[tuple[str, list[discord.SelectOption]]]):
         super().__init__(timeout=600)
         self.embed = embed
-        self.secimler = {ad: True for ad in _sablon_kanal_adlari()}
-        self.butonlar: dict[str, discord.ui.Button] = {}
+        self.gruplar = gruplar
+        self.secimler: dict[int, bool] = {}   # kanal_id -> kalacak mı
+        self.sablon_secimler: dict[str, bool] = {}  # şablon adı -> kurulacak mı
+        self.selects: list[discord.ui.Select] = []
+        self.select_etiketleri: list[str] = []
 
-        for satir, ad in enumerate(_sablon_kanal_adlari()):
-            buton = discord.ui.Button(
-                label=f"✅ #{ad}",
-                style=discord.ButtonStyle.success,
-                row=satir % 5,
+        for i, (etiket, secenekler) in enumerate(gruplar):
+            secenekler = secenekler[:25]
+            select = discord.ui.Select(
+                custom_id=f"sukur_grup_{i}",
+                placeholder=f"{etiket} ({len(secenekler)}/{len(secenekler)} seçili)",
+                options=secenekler,
+                min_values=0,
+                max_values=len(secenekler),
+                row=i % 5,
             )
-            buton.callback = lambda inter, a=ad: self._secim_degistir(inter, a)
-            self.butonlar[ad] = buton
-            self.add_item(buton)
+            select.callback = lambda inter, i=i: self._secim(inter, i)
+            self.selects.append(select)
+            self.select_etiketleri.append(etiket)
+            self.add_item(select)
 
-        kur = discord.ui.Button(label="⚙️ Kur", style=discord.ButtonStyle.danger, row=4)
+            for secenek in secenekler:
+                if secenek.value.startswith("sablon:"):
+                    self.sablon_secimler[secenek.value.split(":", 1)[1]] = True
+                else:
+                    self.secimler[int(secenek.value)] = True
+
+        kur = discord.ui.Button(label="⚙️ Onayla ve Uygula", style=discord.ButtonStyle.danger, row=4)
         kur.callback = self._kur_onay
         self.add_item(kur)
 
-    async def _secim_degistir(self, interaction: discord.Interaction, ad: str):
-        self.secimler[ad] = not self.secimler[ad]
-        buton = self.butonlar[ad]
-        if self.secimler[ad]:
-            buton.label = f"✅ #{ad}"
-            buton.style = discord.ButtonStyle.success
-        else:
-            buton.label = f"⬜ #{ad}"
-            buton.style = discord.ButtonStyle.secondary
+    async def _secim(self, interaction: discord.Interaction, index: int):
+        select = self.selects[index]
+        secilen_set = set(select.values)
+        etiket = self.select_etiketleri[index]
+        for secenek in select.options:
+            if secenek.value.startswith("sablon:"):
+                ad = secenek.value.split(":", 1)[1]
+                self.sablon_secimler[ad] = secenek.value in secilen_set
+            else:
+                kanal_id = int(secenek.value)
+                self.secimler[kanal_id] = secenek.value in secilen_set
+        select.placeholder = f"{etiket} ({len(secilen_set)}/{len(select.options)} seçili)"
         await interaction.response.edit_message(view=self)
 
     async def _kur_onay(self, interaction: discord.Interaction):
         guild = interaction.guild
-        secilen = {ad for ad, sec in self.secimler.items() if sec}
+        kalacak = {kid for kid, sec in self.secimler.items() if sec}
+        kurulacak = {ad for ad, sec in self.sablon_secimler.items() if sec}
+
         silinecek = 0
         for kanal in guild.channels:
             if isinstance(kanal, discord.CategoryChannel):
-                if kanal.name != TICKET_KATEGORI_ADI and kanal.name not in KANAL_SABLONU:
-                    silinecek += 1
-            elif kanal.name.startswith(TICKET_KANAL_ON_EK):
                 continue
-            elif kanal.name not in secilen:
+            if kanal.name.startswith(TICKET_KANAL_ON_EK):
+                continue
+            if kanal.id not in kalacak:
                 silinecek += 1
 
         embed = discord.Embed(
             title="⚠️ Onay Gerekli",
             description=(
-                f"**{len(secilen)} kanal** kurulacak, **{silinecek} kanal** silinecek.\n\n"
+                f"**{len(kalacak)} kanal** korunacak, **{silinecek} kanal** silinecek, "
+                f"**{len(kurulacak)} şablon kanalı** kurulacak.\n\n"
                 f"Ticket kanalları (ticket-*) korunur. Onaylıyor musun?"
             ),
             color=discord.Color.orange(),
@@ -2186,45 +2201,53 @@ class SunucuKurView(discord.ui.View):
         onay = OnayView(
             onayla=self._kur_uygula,
             vazgec=self._vazgec,
-            etiket="✅ Onayla ve Kur",
+            etiket="✅ Onayla ve Uygula",
         )
         await interaction.response.edit_message(embed=embed, view=onay)
 
     async def _vazgec(self, interaction: discord.Interaction):
-        await interaction.response.edit_message(embed=self.embed, view=SunucuKurView(self.embed))
+        await interaction.response.edit_message(embed=self.embed, view=SunucuKurView(self.embed, self.gruplar))
 
     async def _kur_uygula(self, interaction: discord.Interaction):
         await interaction.response.defer()
-        secilen = {ad for ad, sec in self.secimler.items() if sec}
-        sonuc = await _sunucu_kur(interaction.guild, secilen)
+        kalacak = {kid for kid, sec in self.secimler.items() if sec}
+        kurulacak = {ad for ad, sec in self.sablon_secimler.items() if sec}
+        sonuc = await _sunucu_kur(interaction.guild, kalacak, kurulacak)
         await interaction.followup.edit_message(interaction.message.id, content=sonuc, embed=None, view=None)
 
 
-async def _sunucu_kur(guild: discord.Guild, secilen: set[str]) -> str:
-    """Seçilen kanalları kurar, seçilmeyenleri ve şablon dışı kanalları siler."""
+async def _sunucu_kur(guild: discord.Guild, kalacak: set[int], kurulacak: set[str]) -> str:
+    """Seçilmeyen kanalları siler, eksik şablon kanallarını kurar, YÖNETİM izinlerini uygular."""
     kurulan = 0
     silinen = 0
     mod_rolleri = [r for r in guild.roles if r.name in MODERATOR_ROL_ADLARI]
 
-    # 1) Fazla kanalları sil (ticket korunur)
+    # 1) Seçilmeyen kanalları sil (ticket korunur)
     for kanal in list(guild.channels):
+        if isinstance(kanal, discord.CategoryChannel):
+            continue
+        if kanal.name.startswith(TICKET_KANAL_ON_EK):
+            continue
+        if kanal.id in kalacak:
+            continue
         try:
-            if isinstance(kanal, discord.CategoryChannel):
-                if kanal.name == TICKET_KATEGORI_ADI or kanal.name in KANAL_SABLONU:
-                    continue
-                await kanal.delete(reason="/sunucukur - şablon temizliği")
-                silinen += 1
-            elif kanal.name.startswith(TICKET_KANAL_ON_EK):
-                continue
-            elif kanal.name in secilen:
-                continue
-            else:
-                await kanal.delete(reason="/sunucukur - şablon temizliği")
-                silinen += 1
+            await kanal.delete(reason="/sunucukur - seçim temizliği")
+            silinen += 1
         except discord.HTTPException:
             pass
 
-    # 2) Kategorileri ve seçilen kanalları oluştur
+    # 2) Boş kalan kategorileri sil (Tickets hariç)
+    for kategori in list(guild.categories):
+        if kategori.name == TICKET_KATEGORI_ADI:
+            continue
+        if not kategori.channels:
+            try:
+                await kategori.delete(reason="/sunucukur - boş kategori")
+                silinen += 1
+            except discord.HTTPException:
+                pass
+
+    # 3) Eksik şablon kanallarını kur
     for kategori_adi, kanallar in KANAL_SABLONU.items():
         kategori = discord.utils.get(guild.categories, name=kategori_adi)
         if kategori is None:
@@ -2234,7 +2257,7 @@ async def _sunucu_kur(guild: discord.Guild, secilen: set[str]) -> str:
                 kategori = None
 
         for kanal_adi, tur in kanallar:
-            if kanal_adi not in secilen:
+            if kanal_adi not in kurulacak:
                 continue
             if discord.utils.get(guild.channels, name=kanal_adi) is not None:
                 continue
@@ -2262,7 +2285,7 @@ async def _sunucu_kur(guild: discord.Guild, secilen: set[str]) -> str:
             except discord.HTTPException:
                 pass
 
-    # 3) YÖNETİM kanalını sadece yetkili rollerine aç (@everyone kapalı)
+    # 4) YÖNETİM kanalını sadece yetkili rollerine aç (@everyone kapalı)
     yonetim = discord.utils.get(guild.categories, name="YONETIM")
     if yonetim is not None:
         yonetim_izinleri = {
@@ -2280,32 +2303,73 @@ async def _sunucu_kur(guild: discord.Guild, secilen: set[str]) -> str:
         except discord.HTTPException:
             pass
 
-    return f"✅ **Sunucu kurulumu tamamlandı:** {kurulan} kanal kuruldu, {silinen} kanal silindi."
+    return f"✅ **Sunucu kurulumu tamamlandı:** {kurulan} şablon kanalı kuruldu, {silinen} kanal silindi."
 
 
-@bot.tree.command(name="sunucukur", description="Kanal şablonunu anket ile kurar (seçilmeyen kanalları siler!).")
+@bot.tree.command(name="sunucukur", description="Mevcut kanalları seçtirir, şablon eksiklerini kurar (seçilmeyen silinir!).")
 @app_commands.checks.has_permissions(administrator=True)
 async def sunucukur(interaction: discord.Interaction):
     if interaction.guild is None:
         await interaction.response.send_message("Bu komut sadece sunucuda kullanılabilir.", ephemeral=True)
         return
 
-    satirlar = []
-    for kategori_adi, kanallar in KANAL_SABLONU.items():
-        satirlar.append(f"**{kategori_adi}**")
-        for ad, tur in kanallar:
-            satirlar.append(f"- {'🎧' if tur == 'ses' else '#️⃣'} {ad}")
-        satirlar.append("")
+    guild = interaction.guild
+    gruplar: list[tuple[str, list[discord.SelectOption]]] = []
+
+    def _secenek(kanal):
+        etiket = f"🔊 {kanal.name}" if isinstance(kanal, (discord.VoiceChannel, discord.StageChannel)) else f"#{kanal.name}"
+        return discord.SelectOption(label=etiket, value=str(kanal.id), default=True)
+
+    # Her mevcut kategori için (ticket hariç)
+    for kategori in guild.categories:
+        if kategori.name == TICKET_KATEGORI_ADI:
+            continue
+        kanallar = [
+            k for k in kategori.channels
+            if isinstance(k, (discord.TextChannel, discord.VoiceChannel, discord.StageChannel))
+        ]
+        if not kanallar:
+            continue
+        gruplar.append((kategori.name, [_secenek(k) for k in kanallar]))
+
+    # Kategorisiz kanallar (ticket hariç)
+    kategorisiz = [
+        k for k in guild.channels
+        if isinstance(k, (discord.TextChannel, discord.VoiceChannel, discord.StageChannel))
+        and k.category is None
+        and not k.name.startswith(TICKET_KANAL_ON_EK)
+    ]
+    if kategorisiz:
+        gruplar.append(("Kategorisiz", [_secenek(k) for k in kategorisiz]))
+
+    # Şablondan eksik kanallar (yeni kurulacaklar)
+    sablon_eksik = [
+        (ad, tur)
+        for kategori_adi, kanallar in KANAL_SABLONU.items()
+        for ad, tur in kanallar
+        if discord.utils.get(guild.channels, name=ad) is None
+    ]
+    if sablon_eksik:
+        sablon_secenekler = [
+            discord.SelectOption(
+                label=f"🔊 {ad}" if tur == "ses" else f"#{ad}",
+                value=f"sablon:{ad}",
+                default=True,
+            )
+            for ad, tur in sablon_eksik
+        ]
+        gruplar.append(("Şablon (Yeni kurulacak)", sablon_secenekler))
+
     embed = discord.Embed(
-        title="🏗️ Sunucu Kurulum Şablonu",
+        title="🏗️ Sunucu Kurulum Sihirbazı",
         description=(
-            "Aşağıdaki kanalların hangilerinin kurulacağını seç.\n"
-            "**Seçmediğin kanallar ve şablonda olmayan eski kanallar silinir** "
-            "(ticket-* kanalları korunur).\n\n" + "\n".join(satirlar)
+            "Kategorilerdeki kanallardan **kalacakları** seç (hepsi varsayılan seçili).\n"
+            "**Şablon (Yeni kurulacak)** bölümünden kurulacak şablon kanallarını seç.\n\n"
+            "⚠️ Seçmediğin kanallar **silinir** (ticket-* korunur)."
         ),
         color=discord.Color.blurple(),
     )
-    await interaction.response.send_message(embed=embed, view=SunucuKurView(embed))
+    await interaction.response.send_message(embed=embed, view=SunucuKurView(embed, gruplar))
 
 
 # ============================================
