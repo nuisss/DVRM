@@ -171,7 +171,7 @@ class TicketPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Create ticket", emoji="📩", style=discord.ButtonStyle.secondary, custom_id="ticket_create_button")
+    @discord.ui.button(label="Revolution", emoji="📩", style=discord.ButtonStyle.secondary, custom_id="ticket_create_button")
     async def create_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild = interaction.guild
         if guild is None or not isinstance(interaction.user, discord.Member):
@@ -245,10 +245,10 @@ async def ticketpanel(interaction: discord.Interaction):
 
     embed = discord.Embed(
         description=(
-            "📩 **Need Help? Open a Ticket!**\n\n"
+            "📩 **Yardım/Partnerlik/Ally/Yetkili Alim için Ticket Açabilirsin**\n\n"
             "If you have any **questions**, **issues**, or need **support**, our team is here to help you.\n\n"
-            "📩 Click the button below to **open a support ticket**.\n"
-            "Please **describe your issue clearly** so we can assist you as quickly as possible."
+            "📩 **Ticket Açmak** için alltaki butona tıkla.\n"
+            "Sorununu **Direk Belirt** işimizin hızlanması için.\n"
         ),
         color=discord.Color.blurple(),
     )
