@@ -2127,44 +2127,101 @@ class OnayView(discord.ui.View):
 class SunucuKurView(discord.ui.View):
     """Mevcut kanalları + şablon eksiklerini dropdown'larla seçtirir; seçilmeyenleri siler."""
 
+    SAYFA_BASINA = 2  # her sayfada en fazla 2 dropdown (her biri 2 satır kaplar, toplam 5 satır var)
+
     def __init__(self, embed: discord.Embed, gruplar: list[tuple[str, list[discord.SelectOption]]]):
         super().__init__(timeout=600)
         self.embed = embed
-        self.gruplar = gruplar
+        self.gruplar = gruplar  # orijinal gruplar (vazgeç/tekrar çiz için)
+        self.sayfa = 0
         self.secimler: dict[int, bool] = {}   # kanal_id -> kalacak mı
         self.sablon_secimler: dict[str, bool] = {}  # şablon adı -> kurulacak mı
-        self.selects: list[discord.ui.Select] = []
-        self.select_etiketleri: list[str] = []
 
-        for i, (etiket, secenekler) in enumerate(gruplar):
-            secenekler = secenekler[:25]
-            select = discord.ui.Select(
-                custom_id=f"sukur_grup_{i}",
-                placeholder=f"{etiket} ({len(secenekler)}/{len(secenekler)} seçili)",
-                options=secenekler,
-                min_values=0,
-                max_values=len(secenekler),
-                row=i % 5,
-            )
-            select.callback = lambda inter, i=i: self._secim(inter, i)
-            self.selects.append(select)
-            self.select_etiketleri.append(etiket)
-            self.add_item(select)
+        # 25'ten büyük grupları 25'erlik parçalara böl (select başına max 25 seçenek)
+        self.birimler: list[tuple[str, list[discord.SelectOption]]] = []
+        for etiket, secenekler in gruplar:
+            for parca in range(0, len(secenekler), 25):
+                dilim = secenekler[parca:parca + 25]
+                parca_etiket = etiket if len(secenekler) <= 25 else f"{etiket} ({parca // 25 + 1})"
+                self.birimler.append((parca_etiket, dilim))
 
+        # Başlangıçta tümü seçili varsay
+        for etiket, secenekler in self.birimler:
             for secenek in secenekler:
                 if secenek.value.startswith("sablon:"):
                     self.sablon_secimler[secenek.value.split(":", 1)[1]] = True
                 else:
                     self.secimler[int(secenek.value)] = True
 
+        self._sablon_ciz()
+
+    def _sablon_ciz(self):
+        """Mevcut sayfadaki dropdown'ları + gezinme/kur butonlarını çizer."""
+        self.clear_items()
+        birim_sayisi = len(self.birimler)
+        sayfa_sayisi = max(1, (birim_sayisi + self.SAYFA_BASINA - 1) // self.SAYFA_BASINA)
+        if self.sayfa >= sayfa_sayisi:
+            self.sayfa = sayfa_sayisi - 1
+        bas = self.sayfa * self.SAYFA_BASINA
+
+        for yer, asil_i in enumerate(range(bas, min(bas + self.SAYFA_BASINA, birim_sayisi))):
+            etiket, secenekler = self.birimler[asil_i]
+            secili = 0
+            for secenek in secenekler:
+                if secenek.value.startswith("sablon:"):
+                    ad = secenek.value.split(":", 1)[1]
+                    secenek.default = self.sablon_secimler.get(ad, False)
+                    if self.sablon_secimler.get(ad):
+                        secili += 1
+                else:
+                    kid = int(secenek.value)
+                    secenek.default = self.secimler.get(kid, False)
+                    if self.secimler.get(kid):
+                        secili += 1
+
+            select = discord.ui.Select(
+                custom_id=f"sukur_birim_{asil_i}",
+                placeholder=f"{etiket} ({secili}/{len(secenekler)} seçili)",
+                options=secenekler,
+                min_values=0,
+                max_values=len(secenekler),
+                row=yer * 2,  # 0 veya 2 (select 2 satır kaplar)
+            )
+            select.callback = lambda inter, s=select: self._secim(inter, s)
+            self.add_item(select)
+
+        # Gezinme + Kur butonları (satır 4)
+        if sayfa_sayisi > 1:
+            once = discord.ui.Button(label="◀", style=discord.ButtonStyle.secondary, row=4, disabled=self.sayfa == 0)
+            once.callback = self._onceki
+            self.add_item(once)
+            sayfa_btn = discord.ui.Button(
+                label=f"{self.sayfa + 1}/{sayfa_sayisi}", style=discord.ButtonStyle.secondary, row=4, disabled=True
+            )
+            self.add_item(sayfa_btn)
+            sonra = discord.ui.Button(
+                label="▶", style=discord.ButtonStyle.secondary, row=4, disabled=self.sayfa >= sayfa_sayisi - 1
+            )
+            sonra.callback = self._sonraki
+            self.add_item(sonra)
+
         kur = discord.ui.Button(label="⚙️ Onayla ve Uygula", style=discord.ButtonStyle.danger, row=4)
         kur.callback = self._kur_onay
         self.add_item(kur)
 
-    async def _secim(self, interaction: discord.Interaction, index: int):
-        select = self.selects[index]
+    async def _onceki(self, interaction: discord.Interaction):
+        self.sayfa = max(0, self.sayfa - 1)
+        self._sablon_ciz()
+        await interaction.response.edit_message(view=self)
+
+    async def _sonraki(self, interaction: discord.Interaction):
+        sayfa_sayisi = max(1, (len(self.birimler) + self.SAYFA_BASINA - 1) // self.SAYFA_BASINA)
+        self.sayfa = min(sayfa_sayisi - 1, self.sayfa + 1)
+        self._sablon_ciz()
+        await interaction.response.edit_message(view=self)
+
+    async def _secim(self, interaction: discord.Interaction, select: discord.ui.Select):
         secilen_set = set(select.values)
-        etiket = self.select_etiketleri[index]
         for secenek in select.options:
             if secenek.value.startswith("sablon:"):
                 ad = secenek.value.split(":", 1)[1]
@@ -2172,7 +2229,7 @@ class SunucuKurView(discord.ui.View):
             else:
                 kanal_id = int(secenek.value)
                 self.secimler[kanal_id] = secenek.value in secilen_set
-        select.placeholder = f"{etiket} ({len(secilen_set)}/{len(select.options)} seçili)"
+        self._sablon_ciz()
         await interaction.response.edit_message(view=self)
 
     async def _kur_onay(self, interaction: discord.Interaction):
