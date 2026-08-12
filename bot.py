@@ -32,22 +32,31 @@ YTDLP_AYARLARI = {
     "no_warnings": True,
     "default_search": "ytsearch1",
     "source_address": "0.0.0.0",
-    # YouTube'un "Sign in to confirm you're not a bot" kontrolünü atlatmak için
-    # Android/web istemcisi gibi davranıyoruz. Garanti değil (YouTube sık değişiyor)
-    # ama datacenter IP'lerde (Railway vb.) en çok işe yarayan yöntem bu.
-    "extractor_args": {
-        "youtube": {
-            "player_client": ["android", "web"],
-        }
-    },
+    # NOT: YouTube 2026'da "web" ve "android" istemcilerine PO Token (Sign in to
+    # confirm you're not a bot) kontrolü uyguluyor, özellikle Railway gibi
+    # datacenter IP'lerinde neredeyse her zaman engelliyor. Cookies dosyası varsa
+    # bu kısıtlama kaldırılır ve yt-dlp girişli istemcilerle çalışır; yoksa PO Token
+    # gerektirmeyen istemciler denenir (aşağıda). En sağlam çözüm cookies'tır.
 }
+COOKIES_DOSYASI = os.getenv("COOKIES_DOSYASI", "cookies.txt")
+if not os.path.exists(COOKIES_DOSYASI):
+    COOKIES_DOSYASI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+COOKIES_VAR = os.path.exists(COOKIES_DOSYASI)
 
-# Opsiyonel: bir cookies.txt dosyan varsa (Netscape formatında, YouTube'a giriş
-# yapılmış bir hesaptan export edilmiş), COOKIES_DOSYASI ortam değişkenine dosya
-# yolunu yazarsan otomatik kullanılır ve bot tespiti çok daha az tetiklenir.
-COOKIES_DOSYASI = os.getenv("COOKIES_DOSYASI", "")
-if COOKIES_DOSYASI and os.path.exists(COOKIES_DOSYASI):
+if COOKIES_VAR:
+    # Cookies varsa bot kontrolü aşılır; istemci kısıtlaması dayatma, yt-dlp
+    # girişli istemcilerini (tv_downgraded vb.) kendisi seçsin.
     YTDLP_AYARLARI["cookiefile"] = COOKIES_DOSYASI
+    YTDLP_AYARLARI.pop("extractor_args", None)
+    print(f"Cookies dosyası kullanılıyor: {COOKIES_DOSYASI}")
+else:
+    # Cookies yoksa (datacenter IP'de bot kontrolüne takılır), PO Token
+    # gerektirmeyen istemcileri dene: android_vr (Oculus) + web_embedded.
+    YTDLP_AYARLARI["extractor_args"] = {
+        "youtube": {
+            "player_client": ["android_vr", "web_embedded"],
+        }
+    }
 
 FFMPEG_SECENEKLERI = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
