@@ -63,90 +63,12 @@ FFMPEG_SECENEKLERI = {
     "options": "-vn",
 }
 
-# Sunucuya yeni girenlere otomatik verilecek rol. Bu rol tüm normal
-# kanallardan gizlenir; sadece bot'un açtığı kişiye özel kanal görünür.
-UYE_ROLU_ADI = "Üye"
-
-# Renk rolü seçim emojileri -> (görünen isim, hex renk)
-RENK_EMOJILERI = {
-    "🔴": ("Kırmızı", 0xE74C3C),
-    "🟠": ("Turuncu", 0xE67E22),
-    "🟡": ("Sarı", 0xF1C40F),
-    "🟢": ("Yeşil", 0x2ECC71),
-    "🔵": ("Mavi", 0x3498DB),
-    "🟣": ("Mor", 0x9B59B6),
-    "🩷": ("Pembe", 0xFF6FCF),
-    "⚪": ("Beyaz", 0xFFFFFF),
-    "⚫": ("Siyah", 0x4F545C),
-}
-
-_TR_CEVIRI = str.maketrans({
-    "ı": "i", "İ": "i", "ş": "s", "Ş": "s", "ğ": "g", "Ğ": "g",
-    "ü": "u", "Ü": "u", "ö": "o", "Ö": "o", "ç": "c", "Ç": "c",
-})
-
-
-def _kanal_adi_olustur(uye: discord.Member) -> str:
-    """Discord kanal ismi kurallarına uygun (küçük harf, tire, türkçe karaktersiz) isim üretir."""
-    ad = uye.name.lower().translate(_TR_CEVIRI)
-    ad = re.sub(r"[^a-z0-9-]", "-", ad)
-    ad = re.sub(r"-+", "-", ad).strip("-")
-    if not ad:
-        ad = f"uye-{uye.id}"
-    return ad[:90]
-
-
-async def _kanali_uye_rolunden_gizle(kanal: discord.abc.GuildChannel, rol: discord.Role) -> None:
-    """Tek bir kanalı 'Üye' rolünden gizler. Ses/sahne kanallarında ekstra olarak
-    bağlanma iznini de kapatır ki görse bile sese giremesin."""
-    izinler = {"view_channel": False, "reason": "üye rolünden kanalı gizle"}
-    if isinstance(kanal, (discord.VoiceChannel, discord.StageChannel)):
-        izinler["connect"] = False
-    await kanal.set_permissions(rol, **izinler)
-
-
-async def _uye_rolu_getir_veya_olustur(guild: discord.Guild) -> discord.Role:
-    """'Üye' rolünü döndürür; yoksa oluşturur ve mevcut tüm kanallardan gizler."""
-    rol = discord.utils.get(guild.roles, name=UYE_ROLU_ADI)
-    if rol is not None:
-        return rol
-
-    rol = await guild.create_role(
-        name=UYE_ROLU_ADI,
-        permissions=discord.Permissions.none(),
-        reason="otomatik üye rolü - varsayılan kanal erişimini kısıtlamak için",
-    )
-
-    # Rol yeni oluşturulduğunda, mevcut tüm kanallardan bu rolü gizle.
-    # Böylece "Üye" rolüne sahip biri, bot'un kendisine özel açtığı kanal
-    # dışında (o kanalda zaten kişiye özel overwrite var, role ihtiyaç yok)
-    # hiçbir kanalı göremez.
-    for kanal in guild.channels:
-        try:
-            await _kanali_uye_rolunden_gizle(kanal, rol)
-        except discord.HTTPException:
-            pass
-
-    return rol
-
-
 intents = discord.Intents.default()
 intents.voice_states = True
 intents.members = True
 intents.message_content = True  # isim mesajını okuyabilmek için gerekli
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-
-@bot.event
-async def on_guild_channel_create(channel: discord.abc.GuildChannel):
-    """Sunucuda yeni bir kanal (metin/ses/kategori) açıldığında, henüz rol almamış
-    'Üye' rolündeki kişilerden otomatik olarak gizler. Bu sayede yeni açılan bir
-    ses kanalı bile rol verilmeden görünmez/erişilmez olur."""
-    try:
-        rol = await _uye_rolu_getir_veya_olustur(channel.guild)
-        await _kanali_uye_rolunden_gizle(channel, rol)
-    except discord.HTTPException as e:
-        print(f"Yeni kanal Üye rolünden gizlenemedi ({channel}): {e}")
 
 
 # ============================================
@@ -703,11 +625,6 @@ async def on_ready():
             print(f"'{guild.name}' guild senkron hatası: {e}")
 
         try:
-            await _uye_rolu_getir_veya_olustur(guild)
-        except discord.HTTPException as e:
-            print(f"'{UYE_ROLU_ADI}' rolü hazırlanamadı ({guild.name}): {e}")
-
-        try:
             await _sabit_ses_kanaline_baglan(guild)
         except Exception as e:
             print(f"7/24 ses kanalına bağlanılamadı ({guild.name}): {e}")
@@ -743,163 +660,6 @@ async def on_member_join(member: discord.Member):
         f"{member.mention} ({member.name}) sunucuya katıldı.",
         discord.Color.green(),
     )
-
-    # --- 0) 'Üye' rolünü ver: bu rol tüm normal kanallardan gizlidir,
-    # kişi sadece bot'un az sonra açacağı özel karşılama kanalını görebilir ---
-    try:
-        uye_rolu = await _uye_rolu_getir_veya_olustur(guild)
-        await member.add_roles(uye_rolu, reason="sunucuya giriş - otomatik üye rolü")
-    except discord.HTTPException as e:
-        print(f"Üye rolü verilemedi ({member}): {e}")
-
-    # --- 1) Sadece bu üyenin göreceği özel kanalı oluştur ---
-    # Not: "Administrator" yetkisine sahip roller/yöneticiler kanal izin
-    # ayarlarını (overwrite) tamamen atlar, yani @everyone'dan gizlesek
-    # bile yöneticiler bu kanalı zaten görebilir.
-    temel_ad = _kanal_adi_olustur(member)
-    kanal_adi = temel_ad
-    if discord.utils.get(guild.text_channels, name=kanal_adi) is not None:
-        kanal_adi = f"{temel_ad}-{str(member.id)[-4:]}"
-
-    overwrites = {
-        guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        member: discord.PermissionOverwrite(
-            view_channel=True, send_messages=True, read_message_history=True, add_reactions=True
-        ),
-    }
-
-    try:
-        kanal = await guild.create_text_channel(
-            kanal_adi, overwrites=overwrites, reason="karşılama - renk/rol seçim kanalı"
-        )
-    except discord.HTTPException as e:
-        print(f"Karşılama kanalı oluşturulamadı ({member}): {e}")
-        return
-
-    # --- 2) Renk seçimi (reaksiyon) + isim (yazılı mesaj) iste ---
-    renk_listesi = "\n".join(f"{emoji} — {isim}" for emoji, (isim, _) in RENK_EMOJILERI.items())
-    mesaj = await kanal.send(
-        f"{member.mention} hoş geldin! 🎉\n\n"
-        f"**1)** Rolünün rengi için aşağıdaki emojilerden birine tıkla:\n{renk_listesi}\n\n"
-        f"**2)** Rolüne vermek istediğin **ismi** bu kanala yazarak gönder.\n\n"
-        f"İkisini de yaptığında rolün otomatik oluşturulup sana verilecek. (10 dakika içinde tamamla)"
-    )
-    for emoji in RENK_EMOJILERI:
-        try:
-            await mesaj.add_reaction(emoji)
-        except discord.HTTPException:
-            pass
-
-    def reaksiyon_kontrol(payload: discord.RawReactionActionEvent) -> bool:
-        return (
-            payload.message_id == mesaj.id
-            and payload.user_id == member.id
-            and str(payload.emoji) in RENK_EMOJILERI
-        )
-
-    def mesaj_kontrol(m: discord.Message) -> bool:
-        return m.channel.id == kanal.id and m.author.id == member.id
-
-    BEKLEME_SANIYE = 600  # 10 dakika
-
-    secilen_renk_hex = None
-    secilen_isim = None
-
-    renk_task = asyncio.create_task(
-        bot.wait_for("raw_reaction_add", check=reaksiyon_kontrol, timeout=BEKLEME_SANIYE)
-    )
-    isim_task = asyncio.create_task(
-        bot.wait_for("message", check=mesaj_kontrol, timeout=BEKLEME_SANIYE)
-    )
-    bekleyenler = {renk_task, isim_task}
-
-    while bekleyenler:
-        tamamlanan, bekleyenler = await asyncio.wait(bekleyenler, return_when=asyncio.FIRST_COMPLETED)
-        for gorev in tamamlanan:
-            try:
-                sonuc = gorev.result()
-            except asyncio.TimeoutError:
-                for kalan in bekleyenler:
-                    kalan.cancel()
-                await kanal.send("⏰ Süre doldu, işlem iptal edildi. Bu kanal birazdan silinecek.")
-                await asyncio.sleep(10)
-                try:
-                    await kanal.delete(reason="rol seçimi zaman aşımı")
-                except discord.HTTPException:
-                    pass
-                return
-
-            if gorev is renk_task:
-                _, secilen_renk_hex = RENK_EMOJILERI[str(sonuc.emoji)]
-            else:
-                secilen_isim = sonuc.content.strip()[:100]
-
-    if not secilen_isim:
-        secilen_isim = member.display_name
-
-    # --- 3) Rolü oluştur, kişiye özel renkte, üye listesinde ayrı gösterilecek (hoist) ---
-    try:
-        rol = await guild.create_role(
-            name=secilen_isim,
-            color=discord.Color(secilen_renk_hex),
-            hoist=True,
-            reason=f"{member} için renk rolü",
-        )
-        await member.add_roles(rol, reason="renk rolü ataması")
-    except discord.HTTPException as e:
-        await kanal.send(f"⚠️ Rol oluşturulamadı: {e}")
-        return
-
-    # --- 3.1) Özel rol verildi, artık geçici 'Üye' rolüne gerek yok: kaldır ---
-    uye_rolu = discord.utils.get(guild.roles, name=UYE_ROLU_ADI)
-    if uye_rolu is not None and uye_rolu in member.roles:
-        try:
-            await member.remove_roles(uye_rolu, reason="özel rol verildi - üye rolü kaldırıldı")
-        except discord.HTTPException as e:
-            print(f"Üye rolü kaldırılamadı ({member}): {e}")
-
-    await kanal.send(
-        f"✅ **{rol.name}** rolü oluşturuldu ve sana verildi! Bu kanal 10 saniye içinde silinecek."
-    )
-    await asyncio.sleep(10)
-    try:
-        await kanal.delete(reason="rol seçimi tamamlandı")
-    except discord.HTTPException:
-        pass
-
-
-@bot.tree.command(
-    name="kilitle",
-    description="Tüm kanalları 'Üye' rolünden gizler (geriye dönük, yeni ses kanalları dahil).",
-)
-@app_commands.checks.has_permissions(manage_guild=True)
-async def kilitle(interaction: discord.Interaction):
-    if interaction.guild is None:
-        await interaction.response.send_message("Bu komut sadece sunucuda kullanılabilir.", ephemeral=True)
-        return
-
-    await interaction.response.defer(ephemeral=True)
-    guild = interaction.guild
-
-    try:
-        rol = await _uye_rolu_getir_veya_olustur(guild)
-    except discord.HTTPException as e:
-        await interaction.followup.send(f"'{UYE_ROLU_ADI}' rolü hazırlanamadı: {e}", ephemeral=True)
-        return
-
-    basarili = 0
-    basarisiz = 0
-    for kanal in guild.channels:
-        try:
-            await _kanali_uye_rolunden_gizle(kanal, rol)
-            basarili += 1
-        except discord.HTTPException:
-            basarisiz += 1
-
-    ozet = f"🔒 **{basarili}** kanal '{UYE_ROLU_ADI}' rolünden gizlendi/kilitlendi."
-    if basarisiz:
-        ozet += f" ({basarisiz} kanalda izin ayarlanamadı, bot'un yetkisini kontrol et.)"
-    await interaction.followup.send(ozet, ephemeral=True)
 
 
 async def gezdir_loop(member: discord.Member, kanallar: list[discord.VoiceChannel]):
@@ -2914,7 +2674,6 @@ async def botbilgi(interaction: discord.Interaction):
 @godmode.error
 @godmodedurdur.error
 @sil.error
-@kilitle.error
 @ticketpanel.error
 @play.error
 @skip.error
