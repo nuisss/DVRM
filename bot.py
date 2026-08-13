@@ -32,32 +32,25 @@ YTDLP_AYARLARI = {
     "no_warnings": True,
     "default_search": "ytsearch1",
     "source_address": "0.0.0.0",
+    # YouTube 2026'da "web"/"android" istemcilerine PO Token şart koşuyor.
+    # "android_vr" + "web_embedded" PO Token gerektirmez ve DRM'siz ses formatı
+    # verir. "tv" client'ı DRM'li format verdiği için kullanmıyoruz.
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android_vr", "web_embedded"],
+        }
+    },
 }
 
-# NOT: YouTube 2026'da "web" ve "android" istemcilerine PO Token (Sign in to
-# confirm you're not a bot) kontrolü uyguluyor, özellikle Railway gibi
-# datacenter IP'lerinde neredeyse her zaman engelliyor. Bu yüzden client seçimini
-# cookies varlığına göre aşağıda yapıyoruz.
+# Cookies varsa ekstra güç verir ama client'ı DEĞİŞTİRMEZ (her zaman yukarıdakiler).
 COOKIES_DOSYASI = os.getenv("COOKIES_DOSYASI", "cookies.txt")
 if not os.path.exists(COOKIES_DOSYASI):
     COOKIES_DOSYASI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
 COOKIES_VAR = os.path.exists(COOKIES_DOSYASI)
 
-# Client seçimi:
-# - "tv": PO Token gerektirmez ama çerezle (girişli/aktif misafir) format verir.
-#   Datacenter IP'lerde (Railway) çerez yoksa çalışmaz -> cookies.txt şart.
-# - "android_vr": PO Token gerektirmez, çerez kullanmaz; ev IP'sinde çalışır ama
-#   Railway gibi işaretlenmiş IP'lerde "Sign in to confirm you're not a bot" alır.
 if COOKIES_VAR:
     YTDLP_AYARLARI["cookiefile"] = COOKIES_DOSYASI
-    YTDLP_AYARLARI["extractor_args"] = {
-        "youtube": {"player_client": ["tv", "web_embedded"]},
-    }
     print(f"Cookies dosyası kullanılıyor: {COOKIES_DOSYASI}")
-else:
-    YTDLP_AYARLARI["extractor_args"] = {
-        "youtube": {"player_client": ["android_vr", "web_embedded"]},
-    }
 
 FFMPEG_SECENEKLERI = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
