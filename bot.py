@@ -2996,8 +2996,17 @@ def _web_kullanici_yetkili(guild: discord.Guild, user_id: int) -> bool:
     return any(r.name in MODERATOR_ROL_ADLARI for r in uye.roles)
 
 
+# Web panelinde seçilen ses kanalı: guild_id -> kanal_id (bellekte, geçici)
+_web_secili_kanal: dict[int, int] = {}
+
+
 def _web_sunucu_kontrol(guild: discord.Guild) -> discord.VoiceChannel | None:
-    """Web paneli için çalınacak ses kanalını bulur (7/24 sabit kanal öncelikli)."""
+    """Web paneli için çalınacak ses kanalını bulur (panel seçimi > sabit > ilk uygun)."""
+    secili_id = _web_secili_kanal.get(guild.id)
+    if secili_id:
+        kanal = guild.get_channel(secili_id)
+        if isinstance(kanal, discord.VoiceChannel) and kanal.permissions_for(guild.me).connect:
+            return kanal
     ayar_id = _veri.get("sabit_kanal", {}).get(str(guild.id))
     if ayar_id:
         kanal = guild.get_channel(int(ayar_id))
@@ -3033,9 +3042,17 @@ def _web_durum_json(guild: discord.Guild) -> dict:
             "sorgu": kayit.sorgu,
         })
 
+    secili = None
+    secili_id = _web_secili_kanal.get(guild.id)
+    if secili_id:
+        kanal = guild.get_channel(secili_id)
+        if isinstance(kanal, discord.VoiceChannel):
+            secili = kanal.name
+
     return {
         "guild": guild.name,
         "ses_kanali": ses_client.channel.name if ses_client and ses_client.is_connected() else None,
+        "secili_kanal": secili,
         "caliyor": bool(ses_client and ses_client.is_playing()),
         "duraklatildi": bool(ses_client and ses_client.is_paused()),
         "simdi": simdi,
@@ -3261,8 +3278,9 @@ function cizPanel(durum) {
   $('#btnResume').disabled = !durum.duraklatildi;
   $('#btnStop').disabled = !durum.simdi;
 
+  const aktifKanal = durum.secili_kanal || durum.ses_kanali;
   const chans = (durum.kanallar||[]).map(c =>
-    `<option value="${c.id}" ${c.ad === durum.ses_kanali ? 'selected' : ''}>${esc(c.ad)} (${c.kisi})</option>`).join('');
+    `<option value="${c.id}" ${c.ad === aktifKanal ? 'selected' : ''}>${esc(c.ad)} (${c.kisi})</option>`).join('');
   $('#selChan').innerHTML = chans;
 }
 
@@ -3300,6 +3318,13 @@ function cizIskeler() {
   $('#btnStop').onclick = async e => { e.target.disabled = true; try { await api('/api/durdur',{method:'POST'}); } catch{} setTimeout(tazele,1500); };
   $('#btnAra').onclick = ara;
   $('#q').addEventListener('keydown', e => { if (e.key === 'Enter') ara(); });
+  $('#selChan').addEventListener('change', async e => {
+    const id = e.target.value;
+    if (!id) return;
+    try {
+      await api('/api/kanal', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({kanal_id: id}) });
+    } catch (err) { /* hata sessiz, panel devam eder */ }
+  });
 }
 
 async function ara() {
@@ -3510,6 +3535,37 @@ async def _web_oynat_ep(request: aiohttp.web.Request) -> aiohttp.web.Response:
     return aiohttp.web.json_response(sonuc)
 
 
+async def _web_kanal(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    hedef = _web_hedef_guild(request)
+    if hedef is None:
+        return aiohttp.web.json_response({"hata": "yetki"}, status=401)
+    guild, _ = hedef
+    try:
+        veri = await request.json()
+    except Exception:
+        return aiohttp.web.json_response({"hata": "Geçersiz istek."})
+    kanal_id = veri.get("kanal_id")
+    if not kanal_id:
+        return aiohttp.web.json_response({"hata": "Kanal seçilmedi."})
+    kanal = guild.get_channel(int(kanal_id))
+    if not isinstance(kanal, discord.VoiceChannel):
+        return aiohttp.web.json_response({"hata": "Geçersiz ses kanalı."})
+
+    _web_secili_kanal[guild.id] = int(kanal_id)
+
+    # Bot zaten sesliyse ve çalmıyorsa hemen taşınır; çalıyorsa sıradaki şarkı
+    # o kanalda başlar (rahatsız etmemek için anında taşınmaz).
+    ses_client = discord.utils.get(bot.voice_clients, guild=guild)
+    if ses_client is not None and ses_client.is_connected() and not (ses_client.is_playing() or ses_client.is_paused()):
+        try:
+            if ses_client.channel.id != kanal.id:
+                await ses_client.move_to(kanal)
+        except (discord.HTTPException, OSError) as e:
+            return aiohttp.web.json_response({"hata": f"Taşınamadı: {e}"})
+
+    return aiohttp.web.json_response({"ok": True, "kanal": kanal.name})
+
+
 async def _web_atla(request: aiohttp.web.Request) -> aiohttp.web.Response:
     hedef = _web_hedef_guild(request)
     if hedef is None:
@@ -3576,6 +3632,7 @@ async def _web_baslat():
     app.router.add_get("/api/durum", _web_durum)
     app.router.add_get("/api/ara", _web_ara)
     app.router.add_post("/api/oynat", _web_oynat_ep)
+    app.router.add_post("/api/kanal", _web_kanal)
     app.router.add_post("/api/atla", _web_atla)
     app.router.add_post("/api/duraklat", _web_duraklat)
     app.router.add_post("/api/devam", _web_devam)
