@@ -1372,7 +1372,11 @@ async def _sonrakini_cal(guild: discord.Guild):
         return
 
     sira.simdi_calan = sonraki
-    kaynak = discord.FFmpegPCMAudio(stream_url, executable=FFMPEG_YOLU, **FFMPEG_SECENEKLERI)
+    seviye = _veri.get("ses_seviyesi", {}).get(str(guild.id), 80)
+    options = FFMPEG_SECENEKLERI["options"]
+    if 0 <= seviye <= 100 and seviye != 80:
+        options = f'{options} -af volume={seviye / 100:.2f}'
+    kaynak = discord.FFmpegPCMAudio(stream_url, executable=FFMPEG_YOLU, before_options=FFMPEG_SECENEKLERI["before_options"], options=options)
     ses_client.play(kaynak, after=lambda e, g=guild: _sarki_bitince(g, e))
 
     try:
@@ -3152,6 +3156,23 @@ def _web_durum_json(guild: discord.Guild) -> dict:
             "adet": len(uyarilar),
         })
 
+    liderlik = []
+    xp_verisi = _veri.get("xp", {})
+    for anahtar, xp in sorted(xp_verisi.items(), key=lambda kv: kv[1], reverse=True)[:10]:
+        kid, _, uid = anahtar.partition(":")
+        if int(kid) != guild.id:
+            continue
+        uye = guild.get_member(int(uid))
+        if uye is None or uye.bot:
+            continue
+        liderlik.append({
+            "kullanici": uye.display_name,
+            "seviye": _seviye_hesapla(xp)[0],
+            "xp": xp,
+        })
+        if len(liderlik) >= 10:
+            break
+
     return {
         "guild": guild.name,
         "ses_kanali": ses_client.channel.name if ses_client and ses_client.is_connected() else None,
@@ -3184,6 +3205,8 @@ def _web_durum_json(guild: discord.Guild) -> dict:
             "uye_sayaci": sayaclar.get("uye", {}).get("ad"),
             "ses_sayaci": sayaclar.get("ses", {}).get("ad"),
             "uyarilar": uyari_listesi[:10],
+            "liderlik": liderlik,
+            "ses_seviyesi": _veri.get("ses_seviyesi", {}).get(str(guild.id), 80),
         },
     }
 
@@ -3311,6 +3334,11 @@ a.btn:hover, button.btn:hover:not(:disabled) { transform:translateY(-2px); box-s
 button.btn:disabled { opacity:.4; cursor:not-allowed; transform:none; box-shadow:none; }
 button.ghost { background:rgba(255,255,255,.05); color:var(--muted); border:1px solid var(--line); box-shadow:none; }
 button.ghost:hover:not(:disabled) { color:var(--text); box-shadow:none; }
+.btn-mini { background:rgba(248,113,113,.12); color:var(--red); border:1px solid rgba(248,113,113,.3); border-radius:8px; width:26px; height:26px; font-size:12px; cursor:pointer; flex-shrink:0; transition:all .15s; font-family:var(--font-body); }
+.btn-mini:hover { background:rgba(248,113,113,.28); transform:scale(1.08); }
+input[type=range] { flex:1; -webkit-appearance:none; appearance:none; height:6px; border-radius:6px; background:linear-gradient(90deg,var(--accent),var(--accent2)); outline:none; min-width:0; }
+input[type=range]::-webkit-slider-thumb { -webkit-appearance:none; width:18px; height:18px; border-radius:50%; background:#fff; cursor:pointer; box-shadow:0 2px 8px rgba(0,0,0,.4); border:3px solid var(--accent); }
+input[type=range]::-moz-range-thumb { width:18px; height:18px; border-radius:50%; background:#fff; cursor:pointer; border:3px solid var(--accent); }
 .card { background:var(--panel); border-radius:18px; padding:20px; margin-bottom:18px; border:1px solid var(--line); position:relative; z-index:1; backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px); box-shadow:0 10px 34px rgba(0,0,0,.28); transition:border-color .2s, transform .2s; }
 .card:hover { border-color:rgba(255,255,255,.14); }
 .card h2 { font-family:var(--font-head); font-size:14px; margin-bottom:14px; color:var(--muted); letter-spacing:.6px; display:flex; align-items:center; gap:8px; font-weight:600; text-transform:uppercase; min-width:0; }
@@ -3375,6 +3403,14 @@ button.ghost:hover:not(:disabled) { color:var(--text); box-shadow:none; }
 #uyariListe { display:flex; flex-direction:column; gap:4px; max-height:200px; overflow-y:auto; }
 #uyariListe .item { display:flex; justify-content:space-between; gap:8px; background:rgba(255,255,255,.05); padding:7px 10px; border-radius:8px; font-size:13px; min-width:0; }
 #uyariListe .t { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#liderlikListe { display:flex; flex-direction:column; gap:4px; max-height:260px; overflow-y:auto; }
+#liderlikListe .item { display:flex; align-items:center; gap:10px; background:rgba(255,255,255,.05); padding:8px 10px; border-radius:8px; font-size:13px; min-width:0; }
+#liderlikListe .item:nth-child(1) { background:rgba(251,191,36,.10); border:1px solid rgba(251,191,36,.35); }
+#liderlikListe .item:nth-child(2) { background:rgba(154,160,191,.08); border:1px solid rgba(154,160,191,.3); }
+#liderlikListe .item:nth-child(3) { background:rgba(180,83,9,.10); border:1px solid rgba(180,83,9,.35); }
+#liderlikListe .n { width:20px; color:var(--muted); font-family:var(--font-mono); font-size:12px; flex-shrink:0; }
+#liderlikListe .t { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:500; }
+#liderlikListe .s { color:var(--muted); font-size:12px; white-space:nowrap; flex-shrink:0; }
 #toast { position:fixed; bottom:24px; left:50%; transform:translateX(-50%) translateY(20px); background:rgba(20,24,44,.95); border:1px solid var(--line); color:var(--text); padding:12px 22px; border-radius:12px; font-size:14px; box-shadow:0 12px 40px rgba(0,0,0,.5); opacity:0; pointer-events:none; transition:all .3s; z-index:99; backdrop-filter:blur(10px); }
 #toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
 #toast.err { border-color:rgba(248,113,113,.5); }
@@ -3469,7 +3505,8 @@ function cizPanel(durum) {
   if (durum.kuyruk.length) {
     queueHtml = `<div class="siralist">` + durum.kuyruk.map((k,i) =>
       `<div class="item"><span class="n">${i+1}</span><span class="t">${esc(k.baslik)}</span>
-       <span class="s">${esc(k.sure)} · ${esc(k.isteyen)}</span></div>`).join('') + `</div>`;
+       <span class="s">${esc(k.sure)} · ${esc(k.isteyen)}</span>
+       <button class="btn-mini" onclick="siraSil(${i})" title="Sıradan kaldır">✕</button></div>`).join('') + `</div>`;
   }
 
   $('#simdi').innerHTML = nowHtml;
@@ -3491,93 +3528,67 @@ function cizPanel(durum) {
 
 function cizYonet(durum) {
   const y = durum.yönetim;
-  const box = $('#yonet');
-  if (!y || !box) return;
+  if (!y) return;
 
   const koruma = y.koruma || {};
   const korumaMetin = Object.keys(koruma).map(k =>
     `<span class="chip ${koruma[k] ? 'on' : 'off'}" onclick="yonetKoruma('${k}','${koruma[k]}')">${esc(k)} ${koruma[k] ? '✅' : '❌'}</span>`
   ).join(' ');
+  const ka = $('#korumaAlan'); if (ka) ka.innerHTML = korumaMetin || '<span class="empty">—</span>';
+
+  const sa = $('#sunucuAlan');
+  if (sa) sa.innerHTML = `👥 ${y.insan_sayisi} kişi · 🤖 ${y.bot_sayisi} bot · ${y.uye_sayisi} toplam<br>💬 ${y.metin_kanali} metin · 🔊 ${y.ses_kanali} ses`;
+
+  const kaa = $('#kanalAyarAlan');
+  if (kaa) kaa.innerHTML =
+    `📝 Log: <b>${esc(y.log_kanali || '—')}</b><br>` +
+    `🚪 Giriş/Çıkış: <b>${esc(y.giris_cikis_kanali || '—')}</b><br>` +
+    `🔁 7/24: <b>${esc(y.sabit_kanal || '—')}</b><br>` +
+    `🔢 Üye sayaç: <b>${esc(y.uye_sayaci || '—')}</b> · Ses sayaç: <b>${esc(y.ses_sayaci || '—')}</b>`;
 
   const uyarilar = (y.uyarilar || []).map(u =>
     `<div class="item"><span class="t">${esc(u.kullanici)}</span><span class="s">${u.adet} uyarı</span></div>`
   ).join('') || '<div class="empty">Uyarı yok.</div>';
+  const ul = $('#uyariListe'); if (ul) ul.innerHTML = uyarilar;
 
-  const voiceOptions = (durum.kanallar || []).map(c =>
-    `<option value="${c.id}">${esc(c.ad)}</option>`).join('');
-  const textOptions = (durum.metin_kanallar || []).map(c =>
-    `<option value="${c.id}">#${esc(c.ad)}</option>`).join('');
+  const liderlik = (y.liderlik || []).map((u,i) =>
+    `<div class="item"><span class="n">${i+1}.</span><span class="t">${esc(u.kullanici)}</span><span class="s">Seviye ${u.seviye} · ${u.xp} XP</span></div>`
+  ).join('') || '<div class="empty">XP verisi yok.</div>';
+  const ll = $('#liderlikListe'); if (ll) ll.innerHTML = liderlik;
 
-  box.innerHTML = `
-    <div class="yonet-grid">
-      <div class="yn-block">
-        <h3>🛡️ Koruma</h3>
-        <p>${korumaMetin}</p>
-      </div>
-      <div class="yn-block">
-        <h3>📊 Sunucu</h3>
-        <p>👥 ${y.insan_sayisi} kişi · 🤖 ${y.bot_sayisi} bot · ${y.uye_sayisi} toplam</p>
-        <p>💬 ${y.metin_kanali} metin · 🔊 ${y.ses_kanali} ses</p>
-      </div>
-      <div class="yn-block">
-        <h3>⚙️ Kanal Ayarları</h3>
-        <p>📝 Log: <b>${esc(y.log_kanali || '—')}</b></p>
-        <p>🚪 Giriş/Çıkış: <b>${esc(y.giris_cikis_kanali || '—')}</b></p>
-        <p>🔁 7/24: <b>${esc(y.sabit_kanal || '—')}</b></p>
-        <p>🔢 Üye sayaç: <b>${esc(y.uye_sayaci || '—')}</b> · Ses sayaç: <b>${esc(y.ses_sayaci || '—')}</b></p>
-      </div>
-    </div>
+  const voz = (durum.kanallar || []).map(c => `<option value="${c.id}">${esc(c.ad)}</option>`).join('');
+  const metin = (durum.metin_kanallar || []).map(c => `<option value="${c.id}">#${esc(c.ad)}</option>`).join('');
 
-    <div class="yn-row">
-      <div class="yn-block">
-        <h3>🔁 7/24 Ses Kanalı</h3>
-        <div class="searchbar">
-          <select class="sel" id="sel724">${voiceOptions}</select>
-          <button class="btn" onclick="yonet('724')">Uygula</button>
-        </div>
-      </div>
-      <div class="yn-block">
-        <h3>🔢 Sayaç Kur</h3>
-        <div class="searchbar">
-          <select class="sel" id="selSayacTur">
-            <option value="uye">Üye</option>
-            <option value="ses">Ses</option>
-          </select>
-          <select class="sel" id="selSayacKanal">${voiceOptions}</select>
-          <button class="btn" onclick="yonet('sayackur')">Kur</button>
-        </div>
-      </div>
-      <div class="yn-block">
-        <h3>📝 Kanal Ata</h3>
-        <div class="searchbar">
-          <select class="sel" id="selKanalTur">
-            <option value="log">Log</option>
-            <option value="giriscikis">Giriş/Çıkış</option>
-          </select>
-          <select class="sel" id="selKanalKanal">${textOptions}</select>
-          <button class="btn" onclick="yonet('kanal_ayarla')">Ata</button>
-        </div>
-      </div>
-    </div>
+  const doldur = (id, html, seciliAd) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const eski = el.value;
+    el.innerHTML = html;
+    if (eski && [...el.options].some(o => o.value === eski)) el.value = eski;
+  };
+  doldur('sel724', voz);
+  doldur('selSayacKanal', voz);
+  doldur('selKanalKanal', metin);
+  doldur('selDuyuruKanal', metin);
 
-    <div class="yn-row">
-      <div class="yn-block">
-        <h3>📣 Duyuru Gönder</h3>
-        <div class="searchbar">
-          <input id="duyuruMetin" placeholder="Duyuru mesajı..." autocomplete="off">
-          <select class="sel" id="selDuyuruKanal">${textOptions}</select>
-          <button class="btn" onclick="yonet('duyuru')">Kanal</button>
-        </div>
-        <div class="searchbar" style="margin-top:8px">
-          <input id="dmduyuruMetin" placeholder="Tüm üyelere DM mesajı..." autocomplete="off">
-          <button class="btn" onclick="yonet('genelduyuru')">📨 DM'le</button>
-        </div>
-      </div>
-      <div class="yn-block">
-        <h3>⚠️ Uyarılar</h3>
-        <div id="uyariListe">${uyarilar}</div>
-      </div>
-    </div>`;
+  const sd = $('#sesSlider');
+  if (sd && y.ses_seviyesi !== undefined && !sd.dataset.kurulu) {
+    sd.value = y.ses_seviyesi;
+    sd.dataset.kurulu = '1';
+    const sdv = $('#sesDeger');
+    if (sdv) sdv.textContent = 'Mevcut seviye: %' + y.ses_seviyesi;
+    sd.oninput = () => { if (sdv) sdv.textContent = 'Seviye: %' + sd.value; };
+  }
+}
+
+async function sesAyarla() {
+  const sd = $('#sesSlider');
+  if (!sd) return;
+  try {
+    const j = await api('/api/yonet', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({islem:'ses', seviye: parseInt(sd.value, 10)}) });
+    if (j.hata) toast('⚠️ ' + j.hata, true); else toast('🔊 Ses seviyesi %' + sd.value + ' olarak ayarlandı.');
+    tazele();
+  } catch {}
 }
 
 async function yonetKoruma(oz, acik) {
@@ -3641,7 +3652,88 @@ function cizIskeler() {
 
     <div class="card">
       <h2>⚙️ Sunucu Yönetimi</h2>
-      <div id="yonet"><div class="empty">Yükleniyor...</div></div>
+      <div id="yonet">
+        <div class="yonet-grid">
+          <div class="yn-block">
+            <h3>🛡️ Koruma</h3>
+            <p id="korumaAlan"><div class="loading">Yükleniyor...</div></p>
+          </div>
+          <div class="yn-block">
+            <h3>📊 Sunucu</h3>
+            <p id="sunucuAlan"><div class="loading">Yükleniyor...</div></p>
+          </div>
+          <div class="yn-block">
+            <h3>⚙️ Kanal Ayarları</h3>
+            <p id="kanalAyarAlan"><div class="loading">Yükleniyor...</div></p>
+          </div>
+        </div>
+
+        <div class="yn-row">
+          <div class="yn-block">
+            <h3>🔁 7/24 Ses Kanalı</h3>
+            <div class="searchbar">
+              <select class="sel" id="sel724"></select>
+              <button class="btn" onclick="yonet('724')">Uygula</button>
+            </div>
+          </div>
+          <div class="yn-block">
+            <h3>🔢 Sayaç Kur</h3>
+            <div class="searchbar">
+              <select class="sel" id="selSayacTur">
+                <option value="uye">Üye</option>
+                <option value="ses">Ses</option>
+              </select>
+              <select class="sel" id="selSayacKanal"></select>
+              <button class="btn" onclick="yonet('sayackur')">Kur</button>
+            </div>
+          </div>
+          <div class="yn-block">
+            <h3>📝 Kanal Ata</h3>
+            <div class="searchbar">
+              <select class="sel" id="selKanalTur">
+                <option value="log">Log</option>
+                <option value="giriscikis">Giriş/Çıkış</option>
+              </select>
+              <select class="sel" id="selKanalKanal"></select>
+              <button class="btn" onclick="yonet('kanal_ayarla')">Ata</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="yn-row">
+          <div class="yn-block">
+            <h3>📣 Duyuru Gönder</h3>
+            <div class="searchbar">
+              <input id="duyuruMetin" placeholder="Duyuru mesajı..." autocomplete="off">
+              <select class="sel" id="selDuyuruKanal"></select>
+              <button class="btn" onclick="yonet('duyuru')">Kanal</button>
+            </div>
+            <div class="searchbar" style="margin-top:8px">
+              <input id="dmduyuruMetin" placeholder="Tüm üyelere DM mesajı..." autocomplete="off">
+              <button class="btn" onclick="yonet('genelduyuru')">📨 DM'le</button>
+            </div>
+          </div>
+          <div class="yn-block">
+            <h3>🔊 Ses Seviyesi</h3>
+            <div class="searchbar">
+              <input type="range" id="sesSlider" min="0" max="100" value="80">
+              <button class="btn" onclick="sesAyarla()">Uygula</button>
+            </div>
+            <p id="sesDeger" style="margin-top:6px; font-size:12px; color:var(--muted)"></p>
+          </div>
+          <div class="yn-block">
+            <h3>⚠️ Uyarılar</h3>
+            <div id="uyariListe"><div class="loading">Yükleniyor...</div></div>
+          </div>
+        </div>
+
+        <div class="yn-row">
+          <div class="yn-block">
+            <h3>🏆 Liderlik (XP)</h3>
+            <div id="liderlikListe"><div class="loading">Yükleniyor...</div></div>
+          </div>
+        </div>
+      </div>
     </div>`;
 
   $('#btnSkip').onclick = async e => { e.target.disabled = true; try { await api('/api/atla',{method:'POST'}); } catch{} setTimeout(tazele,1500); };
@@ -3676,6 +3768,13 @@ async function ara() {
         <div class="r-add">+ Ekle</div>
       </div>`).join('');
   } catch (e) { box.innerHTML = '<div class="loading">Arama hatası: ' + esc(e.message) + '</div>'; }
+}
+
+async function siraSil(i) {
+  try {
+    await api('/api/sirasil', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({indeks: i}) });
+    tazele();
+  } catch {}
 }
 
 async function ekle(i) {
@@ -3987,6 +4086,19 @@ async def _web_yonet(request: aiohttp.web.Request) -> aiohttp.web.Response:
             return aiohttp.web.json_response({"hata": f"Gönderilemedi: {e}"})
         return aiohttp.web.json_response({"ok": True})
 
+    if islem == "ses":
+        seviye = veri.get("seviye")
+        try:
+            seviye = max(0, min(100, int(seviye)))
+        except (TypeError, ValueError):
+            return aiohttp.web.json_response({"hata": "Geçersiz seviye."})
+        _veri.setdefault("ses_seviyesi", {})[str(guild.id)] = seviye
+        _veri_kaydet()
+        ses_client = discord.utils.get(bot.voice_clients, guild=guild)
+        if ses_client is not None and ses_client.is_playing():
+            ses_client.stop()
+        return aiohttp.web.json_response({"ok": True})
+
     if islem == "genelduyuru":
         mesaj = (veri.get("mesaj") or "").strip()
         if not mesaj:
@@ -4007,6 +4119,28 @@ async def _web_yonet(request: aiohttp.web.Request) -> aiohttp.web.Response:
         return aiohttp.web.json_response({"ok": True, "gonderilen": basarili, "toplam": len(hedefler)})
 
     return aiohttp.web.json_response({"hata": "Bilinmeyen işlem."})
+
+
+async def _web_sira_sil(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    """Sıradan belirtilen şarkıyı kaldırır."""
+    hedef = _web_hedef_guild(request)
+    if hedef is None:
+        return aiohttp.web.json_response({"hata": "yetki"}, status=401)
+    guild, _ = hedef
+    try:
+        veri = await request.json()
+    except Exception:
+        return aiohttp.web.json_response({"hata": "Geçersiz istek."})
+    indeks = veri.get("indeks")
+    try:
+        indeks = int(indeks)
+    except (TypeError, ValueError):
+        return aiohttp.web.json_response({"hata": "Geçersiz indeks."})
+    sira = _sira_al(guild.id)
+    if 0 <= indeks < len(sira.kuyruk):
+        silinen = sira.kuyruk.pop(indeks)
+        return aiohttp.web.json_response({"ok": True, "baslik": silinen.baslik})
+    return aiohttp.web.json_response({"hata": "Sırada böyle bir şarkı yok."})
 
 
 async def _web_atla(request: aiohttp.web.Request) -> aiohttp.web.Response:
@@ -4078,6 +4212,7 @@ async def _web_baslat():
     app.router.add_post("/api/kanal", _web_kanal)
     app.router.add_post("/api/yonet", _web_yonet)
     app.router.add_post("/api/atla", _web_atla)
+    app.router.add_post("/api/sirasil", _web_sira_sil)
     app.router.add_post("/api/duraklat", _web_duraklat)
     app.router.add_post("/api/devam", _web_devam)
     app.router.add_post("/api/durdur", _web_durdur)
