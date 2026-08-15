@@ -156,6 +156,7 @@ def _varsayilan_veri() -> dict:
         "xp": {},          # "guild_id:user_id" -> toplam XP
         "uyarilar": {},    # "guild_id:user_id" -> [uyarı kayıtları]
         "log_kanali": {},  # "guild_id" -> kanal_id
+        "giris_cikis_kanali": {},  # "guild_id" -> kanal_id
         "koruma": {},      # "guild_id" -> {"link": bool, "kufur": bool, "spam": bool, "yenihesap": bool}
         "cekilisler": {},  # "mesaj_id" -> çekiliş kaydı
         "sabit_kanal": {}, # "guild_id" -> 7/24 sabit ses kanalı id'si
@@ -191,6 +192,26 @@ def _veri_kaydet() -> None:
 async def _log_gonder(guild: discord.Guild, baslik: str, aciklama: str, renk: discord.Color = discord.Color.blue()):
     """Ayarlanmış log kanalına bir embed gönderir. Kanal ayarlı değilse sessizce döner."""
     kanal_id = _veri["log_kanali"].get(str(guild.id))
+    if not kanal_id:
+        return
+    kanal = guild.get_channel(int(kanal_id))
+    if kanal is None or not isinstance(kanal, discord.TextChannel):
+        return
+    embed = discord.Embed(
+        title=baslik,
+        description=aciklama,
+        color=renk,
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    try:
+        await kanal.send(embed=embed)
+    except discord.HTTPException:
+        pass
+
+
+async def _giris_cikis_gonder(guild: discord.Guild, baslik: str, aciklama: str, renk: discord.Color):
+    """Ayarlanmış giriş/çıkış kanalına bir embed gönderir. Kanal ayarlı değilse sessizce döner."""
+    kanal_id = _veri["giris_cikis_kanali"].get(str(guild.id))
     if not kanal_id:
         return
     kanal = guild.get_channel(int(kanal_id))
@@ -636,6 +657,12 @@ async def on_member_remove(member: discord.Member):
         f"{member.mention} ({member.name}) sunucudan ayrıldı.",
         discord.Color.orange(),
     )
+    await _giris_cikis_gonder(
+        member.guild,
+        "📤 Üye Ayrıldı",
+        f"{member.mention} ({member.name}) sunucudan ayrıldı.",
+        discord.Color.orange(),
+    )
 
 
 @bot.event
@@ -732,6 +759,12 @@ async def on_member_join(member: discord.Member):
             return
 
     await _log_gonder(
+        guild,
+        "📥 Üye Katıldı",
+        f"{member.mention} ({member.name}) sunucuya katıldı.",
+        discord.Color.green(),
+    )
+    await _giris_cikis_gonder(
         guild,
         "📥 Üye Katıldı",
         f"{member.mention} ({member.name}) sunucuya katıldı.",
@@ -1839,6 +1872,19 @@ async def logkanali(interaction: discord.Interaction, kanal: discord.TextChannel
     _veri["log_kanali"][str(interaction.guild.id)] = str(kanal.id)
     _veri_kaydet()
     await interaction.response.send_message(f"📝 Log kanalı **#{kanal.name}** olarak ayarlandı.")
+
+
+@bot.tree.command(name="giriscikis", description="Üye giriş/çıkış mesajlarının gönderileceği kanalı ayarlar.")
+@app_commands.describe(kanal="Giriş/çıkış mesajlarının gönderileceği metin kanalı")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def giriscikis(interaction: discord.Interaction, kanal: discord.TextChannel):
+    if interaction.guild is None:
+        await interaction.response.send_message("Bu komut sadece sunucuda kullanılabilir.", ephemeral=True)
+        return
+
+    _veri["giris_cikis_kanali"][str(interaction.guild.id)] = str(kanal.id)
+    _veri_kaydet()
+    await interaction.response.send_message(f"📥📤 Giriş/çıkış kanalı **#{kanal.name}** olarak ayarlandı.")
 
 
 # ============================================
