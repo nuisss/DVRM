@@ -7,6 +7,7 @@ import asyncio
 import itertools
 import functools
 import datetime
+import urllib.request
 
 import discord
 from discord import app_commands
@@ -139,6 +140,7 @@ def _varsayilan_veri() -> dict:
         "sabit_kanal": {}, # "guild_id" -> 7/24 sabit ses kanalı id'si
         "sayac": {},      # "guild_id" -> {"uye": {"kanal_id","ad"}, "ses": {...}}
         "duyuru_kapali": {},  # "guild_id:user_id" -> True (genel duyuru almak istemeyenler)
+        "begenilenler": {},  # "guild_id:url" -> True (sitede beğenilen şarkılar)
     }
 
 
@@ -1201,6 +1203,9 @@ class MuzikSirasi:
     def __init__(self):
         self.kuyruk: list[SarkiKaydi] = []
         self.simdi_calan: SarkiKaydi | None = None
+        self.baslama_zamani: float | None = None      # şarkının başladığı zaman (epoch)
+        self.duraklatma_an: float | None = None       # son duraklatma anı (epoch)
+        self.toplam_duraklatma: float = 0.0           # toplam duraklatılan süre (sn)
 
 
 muzik_siralari: dict[int, MuzikSirasi] = {}  # guild_id -> MuzikSirasi
@@ -1208,6 +1213,15 @@ muzik_siralari: dict[int, MuzikSirasi] = {}  # guild_id -> MuzikSirasi
 
 def _sira_al(guild_id: int) -> MuzikSirasi:
     return muzik_siralari.setdefault(guild_id, MuzikSirasi())
+
+
+def _sira_pozisyonu(sira: MuzikSirasi) -> float:
+    """Çalan/duraklatılmış şarkının saniye cinsinden konumu (karaoke senkronu için)."""
+    if sira.simdi_calan is None or sira.baslama_zamani is None:
+        return 0.0
+    if sira.duraklatma_an is not None:
+        return max(0.0, sira.duraklatma_an - sira.baslama_zamani - sira.toplam_duraklatma)
+    return max(0.0, time.time() - sira.baslama_zamani - sira.toplam_duraklatma)
 
 
 # ============================================
@@ -1303,6 +1317,128 @@ def _sure_metni(saniye) -> str:
     return f"{dk}:{sn:02d}"
 
 
+def _json3_sozler(icerik: str) -> list[dict]:
+    """YouTube'un json3 altyazı formatından zaman damgalı söz satırlarını çıkarır."""
+    veri = json.loads(icerik)
+    satirlar = []
+    for olay in veri.get("events", []):
+        segler = olay.get("segs") or []
+        if not segler:
+            continue
+        metin = "".join(s.get("utf8", "") for s in segler)
+        metin = re.sub(r"<[^>]+>", "", metin).strip()
+        if not metin:
+            continue
+        bas = olay.get("tStartMs", 0) / 1000
+        bit = bas + olay.get("dDurationMs", 0) / 1000
+        satirlar.append({"start": bas, "end": bit, "metin": metin})
+    return satirlar
+
+
+def _vtt_sozler(icerik: str) -> list[dict]:
+    """VTT altyazı formatından zaman damgalı söz satırlarını çıkarır."""
+    satirlar = []
+    zaman_re = re.compile(
+        r"(\d{1,2}):(\d{2}):(\d{2})[.,](\d{3})\s*-->\s*(\d{1,2}):(\d{2}):(\d{2})[.,](\d{3})"
+    )
+
+    def sn(a, b, c, d):
+        return int(a) * 3600 + int(b) * 60 + int(c) + int(d) / 1000
+
+    for blok in re.split(r"\n{2,}", icerik):
+        satirlar_liste = blok.strip().splitlines()
+        if not satirlar_liste:
+            continue
+        es = zaman_re.search(satirlar_liste[0])
+        if not es:
+            continue
+        g = es.groups()
+        bas = sn(*g[:4])
+        bit = sn(*g[4:])
+        metin = " ".join(satirlar_liste[1:])
+        metin = re.sub(r"<[^>]+>", "", metin).strip()
+        if metin:
+            satirlar.append({"start": bas, "end": bit, "metin": metin})
+    return satirlar
+
+
+def _sozleri_cek(sorgu: str) -> dict:
+    """Bloklayıcı: yt-dlp ile video bilgisini ve YouTube altyazılarını çeker,
+    zaman damgalı söz satırlarına çevirir (executor içinde çağrılmalı).
+    Döner: {"baslik", "sanatci", "kapak", "sozler"}"""
+    ayarlar = dict(YTDLP_AYARLARI)
+    ayarlar.pop("format", None)  # söz çekmede ses formatı gerekmez
+    ayarlar.update({"skip_download": True})
+    bilgi = _sarki_ara_ayarla(ayarlar, sorgu)
+    if "entries" in bilgi:
+        girisler = bilgi["entries"] or []
+        if not girisler:
+            raise RuntimeError("Bu şarkı için söz bulunamadı.")
+        bilgi = girisler[0]
+
+    manuel = bilgi.get("subtitles") or {}
+    otomatik = bilgi.get("automatic_captions") or {}
+    if "live_chat" in manuel:
+        manuel.pop("live_chat")
+
+    def _track_sec(diller: dict) -> tuple | None:
+        """Dil önceliğine göre (tr > en > ilk) bir altyazı track'i seçer.
+        YouTube 'tr-XXXX' gibi ekli dil kodları kullanır."""
+        adaylar = []
+        for d in ("tr", "tr-TR", "en", "en-US"):
+            for anahtar, trackler in diller.items():
+                if anahtar == d or anahtar.startswith(d + "-"):
+                    if trackler:
+                        adaylar.append((anahtar, trackler))
+                    break
+        if not adaylar and diller:
+            ilk = next(iter(diller.items()))
+            if ilk[1]:
+                adaylar.append(ilk)
+        for anahtar, trackler in adaylar:
+            # json3 tercih, yoksa vtt; url'si olan ilk track
+            for tercih in ("json3", "vtt"):
+                for t in trackler:
+                    if t.get("ext") == tercih and t.get("url"):
+                        return anahtar, t
+            for t in trackler:
+                if t.get("url"):
+                    return anahtar, t
+        return None
+
+    secim = _track_sec(manuel) or _track_sec(otomatik)
+    if secim is None:
+        raise RuntimeError("Bu şarkı için zaman damgalı söz bulunamadı.")
+
+    track = secim[1]
+    icerik = ""
+    with urllib.request.urlopen(track["url"], timeout=15) as yanit:
+        icerik = yanit.read().decode("utf-8", "replace")
+
+    sozler = []
+    if icerik.strip().startswith("{"):
+        sozler = _json3_sozler(icerik)
+    else:
+        sozler = _vtt_sozler(icerik)
+    if not sozler:
+        raise RuntimeError("Bu şarkı için zaman damgalı söz bulunamadı.")
+
+    # Son satırın bitişini şarkının toplam süresine kadar uzat.
+    sure = bilgi.get("duration")
+    if sure and sozler:
+        sozler[-1]["end"] = max(sozler[-1]["end"], float(sure))
+
+    return {
+        "baslik": bilgi.get("title", ""),
+        "sanatci": bilgi.get("channel") or bilgi.get("uploader") or bilgi.get("artist") or "",
+        "kapak": bilgi.get("thumbnail") or "",
+        "sozler": sozler,
+    }
+
+
+_sozler_cache: dict[str, dict] = {}
+
+
 def _yt_hata_cevir(hata: Exception) -> str:
     """yt-dlp hatalarını kullanıcı dostu Türkçe mesaja çevirir."""
     metin = str(hata)
@@ -1395,6 +1531,9 @@ async def _sonrakini_cal(guild: discord.Guild):
     if 0 <= seviye <= 100 and seviye != 80:
         options = f'{options} -af volume={seviye / 100:.2f}'
     kaynak = discord.FFmpegPCMAudio(stream_url, executable=FFMPEG_YOLU, before_options=FFMPEG_SECENEKLERI["before_options"], options=options)
+    sira.baslama_zamani = time.time()
+    sira.duraklatma_an = None
+    sira.toplam_duraklatma = 0.0
     ses_client.play(kaynak, after=lambda e, g=guild: _sarki_bitince(g, e))
 
     try:
@@ -1576,6 +1715,8 @@ async def duraklat(interaction: discord.Interaction):
         return
 
     ses_client.pause()
+    sira = _sira_al(interaction.guild.id)
+    sira.duraklatma_an = time.time()
     await interaction.response.send_message("⏸️ Duraklatıldı.")
 
 
@@ -1591,6 +1732,10 @@ async def devam(interaction: discord.Interaction):
         return
 
     ses_client.resume()
+    sira = _sira_al(interaction.guild.id)
+    if sira.duraklatma_an is not None:
+        sira.toplam_duraklatma += time.time() - sira.duraklatma_an
+        sira.duraklatma_an = None
     await interaction.response.send_message("▶️ Devam ediyor.")
 
 
@@ -3136,6 +3281,7 @@ def _web_durum_json(guild: discord.Guild) -> dict:
             "thumbnail": sira.simdi_calan.thumbnail or "",
             "isteyen": sira.simdi_calan.isteyen.name,
             "sorgu": sira.simdi_calan.sorgu,
+            "begenildi": bool(_veri.get("begenilenler", {}).get(f"{guild.id}:{sira.simdi_calan.sorgu}")),
         }
 
     kuyruk = []
@@ -3197,6 +3343,7 @@ def _web_durum_json(guild: discord.Guild) -> dict:
         "secili_kanal": secili,
         "caliyor": bool(ses_client and ses_client.is_playing()),
         "duraklatildi": bool(ses_client and ses_client.is_paused()),
+        "pozisyon": _sira_pozisyonu(sira),
         "simdi": simdi,
         "kuyruk": kuyruk,
         "kanallar": [
@@ -3497,6 +3644,24 @@ input[type=range]::-moz-range-thumb { width:18px; height:18px; border-radius:50%
 ::-webkit-scrollbar-thumb:hover { background:rgba(255,255,255,.22); }
 ::-webkit-scrollbar-track { background:transparent; }
 
+/* ---------- karaoke (şarkı sözleri) ---------- */
+.soz-kart { margin-top:16px; border-top:1px dashed var(--line2); padding-top:14px; }
+.soz-kart.kapali { display:none; }
+.soz-bas { display:flex; align-items:center; gap:12px; padding:10px 0; }
+.soz-kapak { width:52px; height:52px; border-radius:12px; object-fit:cover; flex-shrink:0; box-shadow:0 6px 18px rgba(0,0,0,.4); }
+.soz-meta { flex:1; min-width:0; }
+.soz-ad { font-family:var(--font-head); font-weight:700; font-size:16px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.soz-sanatci { color:var(--muted); font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.soz-ikonlar { display:flex; gap:6px; flex-shrink:0; }
+.soz-ikon { background:var(--glass); border:1px solid var(--line2); color:var(--text); width:34px; height:34px; border-radius:10px; cursor:pointer; font-size:15px; transition:all .25s; display:flex; align-items:center; justify-content:center; }
+.soz-ikon:hover { background:var(--glass2); border-color:var(--line2); transform:translateY(-1px); }
+.soz-ikon.on { color:var(--pink); border-color:rgba(244,114,182,.5); background:rgba(244,114,182,.12); }
+.soz-liste { height:340px; overflow-y:auto; padding:14px 8px; position:relative; scroll-behavior:smooth; }
+.soz-line { filter:blur(4px); opacity:.35; font-weight:600; color:var(--muted); font-size:16px; padding:9px 14px; border-radius:10px; transition:all .4s ease; text-align:center; line-height:1.55; }
+.soz-line.near { filter:blur(2px); opacity:.6; color:var(--muted); }
+.soz-line.active { filter:blur(0); opacity:1; font-weight:800; color:#fff; text-shadow:0 0 22px rgba(139,92,246,.55); }
+.soz-yuk { text-align:center; color:var(--muted); padding:26px 10px; font-size:14px; }
+
 /* ---------- responsive ---------- */
 @media (max-width:640px) {
   .wrap { padding:20px 14px 70px; }
@@ -3598,6 +3763,7 @@ function cizPanel(durum) {
         <h2>${esc(s.baslik)}</h2>
         <p>${esc(s.sure)} · istek: ${esc(s.isteyen)}</p>
         ${badge}
+        <button class="btn-mini" onclick="sozAc()" id="btnSoz">🎤 Sözler</button>
       </div>
     </div>`;
   }
@@ -3685,6 +3851,109 @@ function cizYonet(durum) {
   if (sd) sd.onchange = () => { sd.dataset.suruklendi = '1'; };
 }
 
+/* ---------- karaoke: şarkı sözleri ---------- */
+let sozVeri = null;
+let sozAktifIdx = -1;
+let sozTimer = null;
+
+async function sozAc() {
+  const kart = $('#sozKart');
+  if (!kart || !sonDurum || !sonDurum.simdi) return;
+  const acik = !kart.classList.contains('kapali');
+  if (acik) { sozKapat(); return; }
+  kart.classList.remove('kapali');
+  kart.innerHTML = '<div class="soz-yuk">🎤 Sözler aranıyor...</div>';
+  const sorgu = sonDurum.simdi.sorgu;
+  try {
+    const j = await api('/api/sozler?sorgu=' + encodeURIComponent(sorgu));
+    if (!j.ok || !j.sozler || !j.sozler.length) throw new Error('Bu şarkı için söz bulunamadı.');
+    sozVeri = j;
+    sozAktifIdx = -1;
+    sozKartRender(j);
+    if (sozTimer) clearInterval(sozTimer);
+    sozTimer = setInterval(sozTik, 1000);
+  } catch (e) {
+    kart.innerHTML = '<div class="soz-yuk">⚠️ ' + esc(e.message) + '</div>';
+    setTimeout(() => sozKapat(), 3200);
+  }
+}
+
+function sozKapat() {
+  const kart = $('#sozKart');
+  if (kart) kart.classList.add('kapali');
+  sozVeri = null;
+  sozAktifIdx = -1;
+  if (sozTimer) { clearInterval(sozTimer); sozTimer = null; }
+}
+
+function sozKartRender(v) {
+  const kart = $('#sozKart');
+  if (!kart) return;
+  kart.innerHTML = `
+    <div class="soz-bas">
+      <img class="soz-kapak" src="${esc(v.kapak)}" onerror="this.style.display='none'">
+      <div class="soz-meta">
+        <div class="soz-ad">${esc(v.baslik)}</div>
+        <div class="soz-sanatci">${esc(v.sanatci)}</div>
+      </div>
+      <div class="soz-ikonlar">
+        <button class="soz-ikon ${sonDurum.simdi.begenildi ? 'on' : ''}" onclick="sozBegen()" title="Beğen" id="btnBegen">${sonDurum.simdi.begenildi ? '❤️' : '🤍'}</button>
+        <button class="soz-ikon" onclick="sozKopyala()" title="Sözleri kopyala">⋯</button>
+        <button class="soz-ikon" onclick="sozKapat()" title="Kapat">✕</button>
+      </div>
+    </div>
+    <div class="soz-liste" id="sozListe">${v.sozler.map((s,i) =>
+      `<div class="soz-line" data-i="${i}">${esc(s.metin)}</div>`).join('')}</div>`;
+}
+
+async function sozTik() {
+  if (!sozVeri || !sonDurum || !sonDurum.simdi) return;
+  let poz = 0;
+  try {
+    const j = await api('/api/pozisyon');
+    if (j.simdi !== sonDurum.simdi.baslik) return;
+    poz = j.pozisyon || 0;
+  } catch { return; }
+  const satirlar = sozVeri.sozler;
+  let aktif = -1;
+  for (let i = 0; i < satirlar.length; i++) {
+    if (poz >= satirlar[i].start && poz < satirlar[i].end) { aktif = i; break; }
+  }
+  if (aktif === sozAktifIdx) return;
+  sozAktifIdx = aktif;
+  const liste = $('#sozListe');
+  if (!liste) return;
+  const satirEl = liste.children;
+  for (let i = 0; i < satirEl.length; i++) {
+    const fark = aktif === -1 ? 99 : Math.abs(i - aktif);
+    satirEl[i].className = 'soz-line' + (i === aktif ? ' active' : fark === 1 ? ' near' : fark >= 2 ? ' far' : '');
+  }
+  if (aktif >= 0 && satirEl[aktif]) {
+    try { satirEl[aktif].scrollIntoView({ behavior:'smooth', block:'center' }); } catch {}
+  }
+}
+
+async function sozBegen() {
+  if (!sonDurum || !sonDurum.simdi) return;
+  const yeni = !sonDurum.simdi.begenildi;
+  try {
+    const j = await api('/api/begen', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({sorgu: sonDurum.simdi.sorgu, begen: yeni}) });
+    sonDurum.simdi.begenildi = j.begenildi;
+    const b = $('#btnBegen');
+    if (b) { b.className = 'soz-ikon' + (j.begenildi ? ' on' : ''); b.textContent = j.begenildi ? '❤️' : '🤍'; }
+    toast(j.begenildi ? '❤️ Beğenildi' : 'Beğeni kaldırıldı');
+  } catch {}
+}
+
+async function sozKopyala() {
+  if (!sozVeri || !sozVeri.sozler) return;
+  try {
+    const metin = sozVeri.sozler.map(s => s.metin).join('\n');
+    await navigator.clipboard.writeText(`${sozVeri.baslik}\n${sozVeri.sanatci}\n\n${metin}`);
+    toast('📋 Sözler kopyalandı');
+  } catch { toast('Kopyalanamadı', true); }
+}
+
 async function sesAyarla() {
   const sd = $('#sesSlider');
   if (!sd) return;
@@ -3738,6 +4007,7 @@ function cizIskeler() {
     <div class="card">
       <h2>🎧 Şimdi Çalıyor</h2>
       <div id="simdi"><div class="empty">Yükleniyor...</div></div>
+      <div id="sozKart" class="soz-kart kapali"><div class="soz-yuk">🎤 Sözler için butona bas</div></div>
       <div class="controls">
         <button class="btn" id="btnSkip">⏭️ Geç</button>
         <button class="btn" id="btnPause">⏸️ Duraklat</button>
@@ -4278,6 +4548,8 @@ async def _web_duraklat(request: aiohttp.web.Request) -> aiohttp.web.Response:
     guild, _ = hedef
     ses_client = discord.utils.get(bot.voice_clients, guild=guild)
     if ses_client is not None and ses_client.is_playing():
+        sira = _sira_al(guild.id)
+        sira.duraklatma_an = time.time()
         ses_client.pause()
     return aiohttp.web.json_response({"ok": True})
 
@@ -4289,6 +4561,10 @@ async def _web_devam(request: aiohttp.web.Request) -> aiohttp.web.Response:
     guild, _ = hedef
     ses_client = discord.utils.get(bot.voice_clients, guild=guild)
     if ses_client is not None and ses_client.is_paused():
+        sira = _sira_al(guild.id)
+        if sira.duraklatma_an is not None:
+            sira.toplam_duraklatma += time.time() - sira.duraklatma_an
+            sira.duraklatma_an = None
         ses_client.resume()
     return aiohttp.web.json_response({"ok": True})
 
@@ -4301,6 +4577,9 @@ async def _web_durdur(request: aiohttp.web.Request) -> aiohttp.web.Response:
     sira = _sira_al(guild.id)
     sira.kuyruk.clear()
     sira.simdi_calan = None
+    sira.baslama_zamani = None
+    sira.duraklatma_an = None
+    sira.toplam_duraklatma = 0.0
     ses_client = discord.utils.get(bot.voice_clients, guild=guild)
     if ses_client is not None:
         if ses_client.is_playing() or ses_client.is_paused():
@@ -4310,6 +4589,59 @@ async def _web_durdur(request: aiohttp.web.Request) -> aiohttp.web.Response:
         except discord.HTTPException:
             pass
     return aiohttp.web.json_response({"ok": True})
+
+
+async def _web_sozler(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    """Karaoke için zaman damgalı şarkı sözleri: /api/sozler?sorgu=..."""
+    hedef = _web_hedef_guild(request)
+    if hedef is None:
+        return aiohttp.web.json_response({"hata": "yetki"}, status=401)
+    sorgu = (request.query.get("sorgu") or "").strip()
+    if not sorgu:
+        return aiohttp.web.json_response({"hata": "Sorgu eksik."})
+    onbellek = _sozler_cache.get(sorgu)
+    if onbellek is None:
+        try:
+            onbellek = await bot.loop.run_in_executor(None, _sozleri_cek, sorgu)
+            _sozler_cache[sorgu] = onbellek
+        except Exception as e:
+            return aiohttp.web.json_response({"hata": str(e)})
+    return aiohttp.web.json_response({"ok": True, **onbellek})
+
+
+async def _web_pozisyon(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    """Hafif pozisyon endpoint'i (karaoke senkronu sık aralıklarla bunu çeker)."""
+    hedef = _web_hedef_guild(request)
+    if hedef is None:
+        return aiohttp.web.json_response({"hata": "yetki"}, status=401)
+    guild, _ = hedef
+    sira = _sira_al(guild.id)
+    ses_client = discord.utils.get(bot.voice_clients, guild=guild)
+    return aiohttp.web.json_response({
+        "pozisyon": _sira_pozisyonu(sira),
+        "caliyor": bool(ses_client and ses_client.is_playing()),
+        "duraklatildi": bool(ses_client and ses_client.is_paused()),
+        "simdi": sira.simdi_calan.baslik if sira.simdi_calan is not None else None,
+    })
+
+
+async def _web_begen(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    """Şarkı beğenme durumunu kaydeder: POST {sorgu, begen: bool}"""
+    hedef = _web_hedef_guild(request)
+    if hedef is None:
+        return aiohttp.web.json_response({"hata": "yetki"}, status=401)
+    guild, _ = hedef
+    try:
+        veri = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        veri = {}
+    sorgu = (veri.get("sorgu") or "").strip()
+    if not sorgu:
+        return aiohttp.web.json_response({"hata": "Sorgu eksik."})
+    begen = bool(veri.get("begen"))
+    _veri.setdefault("begenilenler", {})[f"{guild.id}:{sorgu}"] = begen
+    _veri_kaydet()
+    return aiohttp.web.json_response({"ok": True, "begenildi": begen})
 
 
 async def _web_baslat():
@@ -4333,6 +4665,9 @@ async def _web_baslat():
     app.router.add_post("/api/duraklat", _web_duraklat)
     app.router.add_post("/api/devam", _web_devam)
     app.router.add_post("/api/durdur", _web_durdur)
+    app.router.add_get("/api/sozler", _web_sozler)
+    app.router.add_get("/api/pozisyon", _web_pozisyon)
+    app.router.add_post("/api/begen", _web_begen)
 
     runner = aiohttp.web.AppRunner(app)
     await runner.setup()
