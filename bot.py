@@ -3098,51 +3098,66 @@ WEB_HTML = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>DVRM Müzik Paneli</title>
 <style>
-:root { --bg:#0f1220; --panel:#171a2b; --panel2:#1e2238; --accent:#5865f2; --text:#e7e9f4; --muted:#8b8fa8; }
+:root { --bg:#0b0e1a; --panel:#141831; --panel2:#1a1f3d; --accent:#5865f2; --accent2:#7b2ff7; --text:#eceef9; --muted:#8b8fa8; --green:#2ecc71; --yellow:#f1c40f; --red:#e74c3c; }
 * { margin:0; padding:0; box-sizing:border-box; }
-body { font-family:'Segoe UI',system-ui,sans-serif; background:linear-gradient(160deg,#0f1220,#141830); color:var(--text); min-height:100vh; }
-.wrap { max-width:960px; margin:0 auto; padding:24px 16px 60px; }
-header { display:flex; align-items:center; justify-content:space-between; margin-bottom:22px; }
-header h1 { font-size:20px; }
-header h1 span { color:var(--accent); }
+body { font-family:'Segoe UI',system-ui,sans-serif; background:var(--bg); color:var(--text); min-height:100vh; overflow-x:hidden; }
+.wrap { max-width:980px; margin:0 auto; padding:24px 16px 60px; position:relative; }
+.glow { position:fixed; top:-120px; left:50%; transform:translateX(-50%); width:700px; height:400px; background:radial-gradient(ellipse at center, rgba(123,47,247,.22), transparent 65%); pointer-events:none; z-index:0; }
+header { display:flex; align-items:center; justify-content:space-between; margin-bottom:22px; position:relative; z-index:1; }
+header h1 { font-size:20px; letter-spacing:.5px; }
+header h1 span { background:linear-gradient(90deg,var(--accent),var(--accent2)); -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
 .usermenu { display:flex; align-items:center; gap:12px; font-size:14px; color:var(--muted); }
-.usermenu img { width:34px; height:34px; border-radius:50%; }
-a.btn, button.btn { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:10px 16px; font-size:14px; cursor:pointer; text-decoration:none; }
-button.btn:disabled { opacity:.5; cursor:not-allowed; }
+.usermenu img { width:34px; height:34px; border-radius:50%; border:2px solid var(--accent); }
+a.btn, button.btn { background:linear-gradient(135deg,var(--accent),var(--accent2)); color:#fff; border:0; border-radius:10px; padding:11px 18px; font-size:14px; font-weight:600; cursor:pointer; text-decoration:none; transition:transform .12s, opacity .12s; }
+a.btn:hover, button.btn:hover:not(:disabled) { transform:translateY(-1px); opacity:.92; }
+button.btn:disabled { opacity:.4; cursor:not-allowed; transform:none; }
 button.ghost { background:transparent; color:var(--muted); border:1px solid #33385a; }
-.card { background:var(--panel); border-radius:14px; padding:18px; margin-bottom:16px; border:1px solid #23284a; }
-.now { display:flex; gap:16px; align-items:center; }
-.now img { width:96px; height:96px; border-radius:10px; object-fit:cover; background:#2a2f52; }
-.now .info h2 { font-size:16px; margin-bottom:4px; }
-.now .info p { color:var(--muted); font-size:13px; }
-.badges { display:flex; gap:8px; margin-top:10px; }
-.badge { padding:4px 10px; border-radius:20px; font-size:12px; }
-.badge.playing { background:#2ecc7122; color:#2ecc71; border:1px solid #2ecc7155; }
-.badge.paused { background:#f39c1222; color:#f39c12; border:1px solid #f39c1255; }
+.card { background:var(--panel); border-radius:16px; padding:20px; margin-bottom:16px; border:1px solid #232849; position:relative; z-index:1; backdrop-filter:blur(4px); }
+.card h2 { font-size:15px; margin-bottom:14px; color:var(--muted); letter-spacing:.3px; display:flex; align-items:center; gap:8px; }
+.card h2 .say { margin-left:auto; background:var(--panel2); padding:2px 10px; border-radius:20px; font-size:12px; color:var(--text); }
+.now { display:flex; gap:18px; align-items:center; }
+.now .thumb { position:relative; width:104px; height:104px; border-radius:14px; overflow:hidden; flex-shrink:0; background:#232849; box-shadow:0 8px 24px rgba(0,0,0,.35); }
+.now .thumb img { width:100%; height:100%; object-fit:cover; }
+.now .info { min-width:0; flex:1; }
+.now .info h2 { font-size:17px; margin-bottom:6px; color:var(--text); display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.now .info p { color:var(--muted); font-size:13px; margin-bottom:10px; }
+.badge { display:inline-flex; align-items:center; gap:6px; padding:5px 12px; border-radius:20px; font-size:12px; font-weight:600; }
+.badge.playing { background:#2ecc7122; color:var(--green); border:1px solid #2ecc7155; }
+.badge.paused { background:#f1c40f22; color:var(--yellow); border:1px solid #f1c40f55; }
 .badge.idle { background:#8b8fa822; color:var(--muted); border:1px solid #8b8fa855; }
-.controls { display:flex; gap:10px; margin-top:14px; flex-wrap:wrap; }
+.eq { display:inline-flex; align-items:flex-end; gap:2px; height:14px; margin-left:4px; }
+.eq span { width:3px; border-radius:2px; background:var(--green); animation:eq 1s ease-in-out infinite; }
+.eq span:nth-child(2){ animation-delay:.2s } .eq span:nth-child(3){ animation-delay:.4s } .eq span:nth-child(4){ animation-delay:.1s }
+@keyframes eq { 0%,100%{height:4px} 50%{height:14px} }
+.controls { display:flex; gap:10px; margin-top:16px; flex-wrap:wrap; align-items:center; }
+.sel { background:var(--panel2); border:1px solid #33385a; color:var(--text); border-radius:10px; padding:10px 14px; font-size:14px; outline:none; min-width:180px; }
 .searchbar { display:flex; gap:10px; }
-.searchbar input { flex:1; background:var(--panel2); border:1px solid #33385a; border-radius:8px; padding:11px 14px; color:var(--text); font-size:14px; outline:none; }
-.results { margin-top:12px; display:flex; flex-direction:column; gap:8px; }
-.res-item { display:flex; align-items:center; gap:12px; background:var(--panel2); padding:10px; border-radius:10px; cursor:pointer; transition:background .15s; }
-.res-item:hover { background:#262b4a; }
-.res-item img { width:48px; height:48px; border-radius:6px; object-fit:cover; }
-.res-item .r-title { font-size:13px; }
-.res-item .r-sub { color:var(--muted); font-size:12px; }
-.siralist { display:flex; flex-direction:column; gap:8px; margin-top:10px; }
-.siralist .item { display:flex; align-items:center; gap:10px; background:var(--panel2); padding:8px 12px; border-radius:8px; font-size:13px; }
-.siralist .n { width:24px; color:var(--muted); text-align:center; }
+.searchbar input { flex:1; background:var(--panel2); border:1px solid #33385a; border-radius:10px; padding:12px 16px; color:var(--text); font-size:14px; outline:none; transition:border .15s; }
+.searchbar input:focus { border-color:var(--accent); }
+.results { margin-top:14px; display:flex; flex-direction:column; gap:8px; max-height:420px; overflow-y:auto; }
+.res-item { display:flex; align-items:center; gap:12px; background:var(--panel2); padding:10px 12px; border-radius:12px; cursor:pointer; transition:background .15s, transform .1s; }
+.res-item:hover { background:#262b4e; transform:translateX(2px); }
+.res-item img { width:48px; height:48px; border-radius:8px; object-fit:cover; flex-shrink:0; }
+.res-item .r-title { font-size:13px; font-weight:600; }
+.res-item .r-sub { color:var(--muted); font-size:12px; margin-top:2px; }
+.res-item .r-add { margin-left:auto; color:var(--accent); font-size:12px; }
+.siralist { display:flex; flex-direction:column; gap:6px; }
+.siralist .item { display:flex; align-items:center; gap:12px; background:var(--panel2); padding:9px 14px; border-radius:10px; font-size:13px; }
+.siralist .n { width:22px; color:var(--muted); text-align:center; font-size:12px; }
 .siralist .t { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .siralist .s { color:var(--muted); font-size:12px; white-space:nowrap; }
-.empty { color:var(--muted); font-size:14px; text-align:center; padding:20px; }
-.loginbox { text-align:center; padding:60px 20px; }
-.loginbox h2 { font-size:22px; margin-bottom:8px; }
-.loginbox p { color:var(--muted); margin-bottom:24px; }
-.sel { background:var(--panel2); border:1px solid #33385a; color:var(--text); border-radius:8px; padding:10px; font-size:14px; }
-.loading { color:var(--muted); font-size:13px; text-align:center; padding:8px; }
+.siralist .head { color:var(--green); font-weight:700; }
+.empty { color:var(--muted); font-size:14px; text-align:center; padding:22px; }
+.loginbox { text-align:center; padding:70px 20px; }
+.loginbox .logo { font-size:56px; margin-bottom:14px; }
+.loginbox h2 { font-size:24px; margin-bottom:10px; color:var(--text); }
+.loginbox p { color:var(--muted); margin-bottom:28px; line-height:1.6; }
+.loading { color:var(--muted); font-size:13px; text-align:center; padding:10px; }
+::-webkit-scrollbar { width:8px; } ::-webkit-scrollbar-thumb { background:#2a2f52; border-radius:8px; }
 </style>
 </head>
 <body>
+<div class="glow"></div>
 <div class="wrap">
 <header>
   <h1>🎧 <span>DVRM</span> Müzik Paneli</h1>
@@ -3154,8 +3169,7 @@ button.ghost { background:transparent; color:var(--muted); border:1px solid #333
 
 <script>
 const $ = s => document.querySelector(s);
-let simdi = null;
-let guvenli = true;
+let sonDurum = null;
 
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -3172,23 +3186,24 @@ async function api(path, opts) {
 function renderLogin() {
   $('#app').innerHTML = `
     <div class="loginbox card">
-      <h2>🎵 Müzik Kontrol Paneli</h2>
+      <div class="logo">🎵</div>
+      <h2>Müzik Kontrol Paneli</h2>
       <p>Şarkı çalmak ve sırayı yönetmek için Discord hesabınla giriş yap.<br>Sunucuda yönetici/moderatör rolünün olması gerekir.</p>
       <a class="btn" href="/login">Discord ile giriş yap</a>
     </div>`;
 }
 
-function renderPanel(durum) {
-  simdi = durum;
+function cizPanel(durum) {
+  sonDurum = durum;
   let badge = durum.duraklatildi ? '<span class="badge paused">⏸️ Duraklatıldı</span>'
-            : durum.caliyor ? '<span class="badge playing">▶️ Çalıyor</span>'
+            : durum.caliyor ? '<span class="badge playing">▶️ Çalıyor<span class="eq"><span></span><span></span><span></span><span></span></span></span>'
             : '<span class="badge idle">⏹️ Boşta</span>';
 
   let nowHtml = '<div class="empty">Şu anda çalan şarkı yok.</div>';
   if (durum.simdi) {
     const s = durum.simdi;
     nowHtml = `<div class="now">
-      <img src="${esc(s.thumbnail)}" onerror="this.style.display='none'">
+      <div class="thumb"><img src="${esc(s.thumbnail)}" onerror="this.style.display='none'"></div>
       <div class="info">
         <h2>${esc(s.baslik)}</h2>
         <p>${esc(s.sure)} · istek: ${esc(s.isteyen)}</p>
@@ -3204,40 +3219,54 @@ function renderPanel(durum) {
        <span class="s">${esc(k.sure)} · ${esc(k.isteyen)}</span></div>`).join('') + `</div>`;
   }
 
-  const chans = (durum.kanallar||[]).map(c =>
-    `<option value="${c.id}">${esc(c.ad)} (${c.kisi})</option>`).join('');
+  $('#simdi').innerHTML = nowHtml;
+  $('#siraAdet').textContent = durum.kuyruk.length;
+  $('#siraListe').innerHTML = queueHtml;
 
+  $('#btnSkip').disabled = !durum.simdi;
+  $('#btnPause').disabled = !(durum.caliyor && !durum.duraklatildi);
+  $('#btnResume').disabled = !durum.duraklatildi;
+  $('#btnStop').disabled = !durum.simdi;
+
+  const chans = (durum.kanallar||[]).map(c =>
+    `<option value="${c.id}" ${c.ad === durum.ses_kanali ? 'selected' : ''}>${esc(c.ad)} (${c.kisi})</option>`).join('');
+  $('#selChan').innerHTML = chans;
+}
+
+function cizIskeler() {
   $('#app').innerHTML = `
     <div class="card">
-      <h2 style="font-size:15px;margin-bottom:10px">🎧 Şimdi Çalıyor</h2>
-      ${nowHtml}
+      <h2>🎧 Şimdi Çalıyor</h2>
+      <div id="simdi"><div class="empty">Yükleniyor...</div></div>
       <div class="controls">
-        <button class="btn" id="btnSkip" ${!durum.simdi?'disabled':''}>⏭️ Geç</button>
-        <button class="btn" id="btnPause" ${!(durum.caliyor&&!durum.duraklatildi)?'disabled':''}>⏸️ Duraklat</button>
-        <button class="btn" id="btnResume" ${!durum.duraklatildi?'disabled':''}>▶️ Devam</button>
-        <button class="btn ghost" id="btnStop" ${!durum.simdi?'disabled':''}>⏹️ Durdur</button>
-        <select class="sel" id="selChan">${chans}</select>
+        <button class="btn" id="btnSkip">⏭️ Geç</button>
+        <button class="btn" id="btnPause">⏸️ Duraklat</button>
+        <button class="btn" id="btnResume">▶️ Devam</button>
+        <button class="btn ghost" id="btnStop">⏹️ Durdur</button>
+        <select class="sel" id="selChan"></select>
       </div>
     </div>
 
     <div class="card">
-      <h2 style="font-size:15px;margin-bottom:10px">🔍 Şarkı Ara ve Ekle</h2>
+      <h2>🔍 Şarkı Ara ve Ekle</h2>
       <div class="searchbar">
-        <input id="q" placeholder="Şarkı adı veya YouTube linki..." onkeydown="if(event.key==='Enter')ara()">
+        <input id="q" placeholder="Şarkı adı veya YouTube linki..." autocomplete="off">
         <button class="btn" id="btnAra">Ara</button>
       </div>
       <div class="results" id="results"></div>
     </div>
 
     <div class="card">
-      <h2 style="font-size:15px;margin-bottom:10px">📜 Sıra (${durum.kuyruk.length})</h2>
-      ${queueHtml}
+      <h2>📜 Sıra <span class="say" id="siraAdet">0</span></h2>
+      <div id="siraListe"><div class="empty">Yükleniyor...</div></div>
     </div>`;
 
   $('#btnSkip').onclick = async e => { e.target.disabled = true; try { await api('/api/atla',{method:'POST'}); } catch{} setTimeout(tazele,1500); };
   $('#btnPause').onclick = async e => { try { await api('/api/duraklat',{method:'POST'}); tazele(); } catch{} };
   $('#btnResume').onclick = async e => { try { await api('/api/devam',{method:'POST'}); tazele(); } catch{} };
   $('#btnStop').onclick = async e => { e.target.disabled = true; try { await api('/api/durdur',{method:'POST'}); } catch{} setTimeout(tazele,1500); };
+  $('#btnAra').onclick = ara;
+  $('#q').addEventListener('keydown', e => { if (e.key === 'Enter') ara(); });
 }
 
 async function ara() {
@@ -3253,6 +3282,7 @@ async function ara() {
         <img src="${esc(s.thumbnail)}" onerror="this.style.display='none'">
         <div><div class="r-title">${esc(s.baslik)}</div>
         <div class="r-sub">${esc(s.sure)} · ${esc(s.kaynak)}</div></div>
+        <div class="r-add">+ Ekle</div>
       </div>`).join('');
   } catch (e) { box.innerHTML = '<div class="loading">Arama hatası: ' + esc(e.message) + '</div>'; }
 }
@@ -3270,8 +3300,8 @@ async function ekle(sorgu) {
 async function tazele() {
   try {
     const j = await api('/api/durum');
-    renderPanel(j);
-  } catch (e) { /* 401 yönlendirmesi api() içinde yapılıyor */ }
+    if (!sonDurum) { cizPanel(j); } else { cizPanel(j); }
+  } catch (e) { /* 401 yönlendirmesi api() içinde */ }
 }
 
 async function init() {
@@ -3281,6 +3311,7 @@ async function init() {
       <img src="${esc(me.avatar)}" onerror="this.style.display='none'">
       <span>${esc(me.ad)}</span>
       <a class="btn ghost" href="/cikis">Çıkış</a>`;
+    cizIskeler();
     tazele();
     setInterval(tazele, 3000);
   } catch (e) {
