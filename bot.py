@@ -13,6 +13,12 @@ from discord import app_commands
 from discord.ext import commands
 import yt_dlp
 
+try:
+    import aiohttp
+    import aiohttp.web
+except ImportError:
+    aiohttp = None
+
 # ============================================
 # AYARLAR
 # ============================================
@@ -663,6 +669,20 @@ async def on_ready():
     bot.add_view(TicketPanelView())
     bot.add_view(TicketCloseView())
 
+    # Rich presence: profil kartında tıklanabilir "Müzik Paneli" bağlantısı.
+    try:
+        aktivite = discord.Activity(
+            name="Müzik Paneli",
+            type=discord.ActivityType.listening,
+            state="🎧 Müzik Paneli'ni Aç",
+            state_url=PUBLIK_URL,
+            details="Siteden şarkı çal",
+            details_url=PUBLIK_URL,
+        )
+        await bot.change_presence(activity=aktivite)
+    except Exception as e:
+        print(f"Presence ayarlanamadı: {e}")
+
     # Devam eden çekilişlerin butonlarını ve süre sayaçlarını geri yükle
     for mid_str, kayit in _veri["cekilisler"].items():
         if kayit.get("bitti"):
@@ -1158,11 +1178,14 @@ class SarkiKaydi:
     dolduğu için kuyrukta sadece arama/sayfa linkini tutuyoruz; gerçek stream URL'i
     şarkı çalınmaya başlarken tazeden çekiliyor."""
 
-    def __init__(self, sorgu: str, baslik: str, isteyen: discord.Member, kanal: discord.abc.Messageable):
+    def __init__(self, sorgu: str, baslik: str, isteyen: discord.Member, kanal: discord.abc.Messageable,
+                 thumbnail: str | None = None, sure: str | None = None):
         self.sorgu = sorgu
         self.baslik = baslik
         self.isteyen = isteyen
         self.kanal = kanal
+        self.thumbnail = thumbnail
+        self.sure = sure
 
 
 class MuzikSirasi:
@@ -1225,6 +1248,18 @@ def _sarki_ara(sorgu: str) -> dict:
         if "entries" in bilgi:
             bilgi = bilgi["entries"][0]
         return bilgi
+
+
+def _sure_metni(saniye) -> str:
+    """Saniye değerini m:ss veya h:mm:ss biçimine çevirir."""
+    if not saniye:
+        return ""
+    saniye = int(saniye)
+    saat, kalan = divmod(saniye, 3600)
+    dk, sn = divmod(kalan, 60)
+    if saat:
+        return f"{saat}:{dk:02d}:{sn:02d}"
+    return f"{dk}:{sn:02d}"
 
 
 def _yt_hata_cevir(hata: Exception) -> str:
@@ -1394,9 +1429,12 @@ async def play(interaction: discord.Interaction, sarki: str):
 
     baslik = bilgi.get("title", sarki)
     sorgu = bilgi.get("webpage_url", sarki)
+    thumbnail = bilgi.get("thumbnail")
+    sure = _sure_metni(bilgi.get("duration"))
 
     sira = _sira_al(interaction.guild.id)
-    kayit = SarkiKaydi(sorgu=sorgu, baslik=baslik, isteyen=interaction.user, kanal=interaction.channel)
+    kayit = SarkiKaydi(sorgu=sorgu, baslik=baslik, isteyen=interaction.user, kanal=interaction.channel,
+                       thumbnail=thumbnail, sure=sure)
     sira.kuyruk.append(kayit)
 
     if sira.simdi_calan is None and not ses_client.is_playing() and not ses_client.is_paused():
@@ -2031,6 +2069,23 @@ KANAL_SABLONU = {
 
 # YÖNETİM kanalını görebilecek rol adları (/rolayarla ile kurulanlar)
 MODERATOR_ROL_ADLARI = ["Kurucu", "Yönetici", "Moderatör", "Yardımcı"]
+
+
+# ============================================
+# WEB PANELİ (müzik kontrolü)
+# ============================================
+# Discord OAuth2 ile giriş yapılır; kullanıcının sunucuda MODERATOR_ROL_ADLARI
+# rollerinden birine sahip olması gerekir. Aynı process içinde aiohttp ile
+# çalışır (ayrı servis gerekmez). Erişim: PUBLIK_URL adresinden.
+WEB_PORT = int(os.getenv("PORT", os.getenv("WEB_PORT", "8080")))
+PUBLIK_URL = os.getenv("PUBLIK_URL", "http://localhost:8080")
+DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "")
+DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "")
+WEB_SESSION_SANIYE = 60 * 60 * 12  # 12 saat
+
+# basit oturum deposu: token -> user_id
+_web_oturumlar: dict[str, int] = {}
+_web_oturum_tarih: dict[str, float] = {}
 
 
 class OnayView(discord.ui.View):
@@ -2868,6 +2923,587 @@ async def komut_hata(interaction: discord.Interaction, error: app_commands.AppCo
         if not interaction.response.is_done():
             await interaction.response.send_message(f"Bir hata oluştu: {error}", ephemeral=True)
         print(f"Komut hatası: {error}")
+
+
+# ============================================
+# WEB PANELİ (OAuth2 + API + arayüz)
+# ============================================
+
+def _web_cookie_al(request: aiohttp.web.Request) -> int | None:
+    """Geçerli oturum varsa kullanıcı id döner, yoksa None."""
+    token = request.cookies.get("dvrms")
+    if not token:
+        return None
+    user_id = _web_oturumlar.get(token)
+    if user_id is None:
+        return None
+    if time.time() - _web_oturum_tarih.get(token, 0) > WEB_SESSION_SANIYE:
+        _web_oturumlar.pop(token, None)
+        _web_oturum_tarih.pop(token, None)
+        return None
+    return user_id
+
+
+def _web_kullanici_yetkili(guild: discord.Guild, user_id: int) -> bool:
+    """Kullanıcının bu sunucuda moderator rolü var mı?"""
+    uye = guild.get_member(user_id)
+    if uye is None:
+        return False
+    return any(r.name in MODERATOR_ROL_ADLARI for r in uye.roles)
+
+
+def _web_sunucu_kontrol(guild: discord.Guild) -> discord.VoiceChannel | None:
+    """Web paneli için çalınacak ses kanalını bulur (7/24 sabit kanal öncelikli)."""
+    ayar_id = _veri.get("sabit_kanal", {}).get(str(guild.id))
+    if ayar_id:
+        kanal = guild.get_channel(int(ayar_id))
+        if isinstance(kanal, discord.VoiceChannel) and kanal.permissions_for(guild.me).connect:
+            return kanal
+    for vc in guild.voice_channels:
+        if vc.permissions_for(guild.me).connect:
+            return vc
+    return None
+
+
+def _web_durum_json(guild: discord.Guild) -> dict:
+    """Panel için anlık durum (çalan şarkı, kuyruk, ses kanalı)."""
+    sira = _sira_al(guild.id)
+    ses_client = discord.utils.get(bot.voice_clients, guild=guild)
+
+    simdi = None
+    if sira.simdi_calan is not None:
+        simdi = {
+            "baslik": sira.simdi_calan.baslik,
+            "sure": sira.simdi_calan.sure or "",
+            "thumbnail": sira.simdi_calan.thumbnail or "",
+            "isteyen": sira.simdi_calan.isteyen.name,
+            "sorgu": sira.simdi_calan.sorgu,
+        }
+
+    kuyruk = []
+    for kayit in sira.kuyruk[:30]:
+        kuyruk.append({
+            "baslik": kayit.baslik,
+            "sure": kayit.sure or "",
+            "isteyen": kayit.isteyen.name,
+            "sorgu": kayit.sorgu,
+        })
+
+    return {
+        "guild": guild.name,
+        "ses_kanali": ses_client.channel.name if ses_client and ses_client.is_connected() else None,
+        "caliyor": bool(ses_client and ses_client.is_playing()),
+        "duraklatildi": bool(ses_client and ses_client.is_paused()),
+        "simdi": simdi,
+        "kuyruk": kuyruk,
+        "kanallar": [
+            {"id": str(vc.id), "ad": vc.name, "kisi": len(vc.members)}
+            for vc in guild.voice_channels if vc.permissions_for(guild.me).connect
+        ],
+    }
+
+
+async def _web_oynat(guild: discord.Guild, sorgu: str, kullanici: discord.Member) -> dict:
+    """Web'den şarkı ekler; gerekirse ses kanalına bağlanır."""
+    kanal = _web_sunucu_kontrol(guild)
+    if kanal is None:
+        return {"hata": "Bağlanabilecek bir ses kanalı bulunamadı."}
+
+    ses_client = discord.utils.get(bot.voice_clients, guild=guild)
+    try:
+        if ses_client is None or not ses_client.is_connected():
+            ses_client = await kanal.connect(self_mute=False, self_deaf=True)
+        elif ses_client.channel.id != kanal.id:
+            await ses_client.move_to(kanal)
+    except (discord.ClientException, discord.HTTPException, OSError) as e:
+        return {"hata": f"Kanala bağlanılamadı: {e}"}
+
+    try:
+        loop = asyncio.get_running_loop()
+        bilgi = await loop.run_in_executor(None, functools.partial(_sarki_ara, sorgu))
+    except Exception as e:
+        return {"hata": _yt_hata_cevir(e)}
+
+    baslik = bilgi.get("title", sorgu)
+    sorgu_url = bilgi.get("webpage_url", sorgu)
+    kayit = SarkiKaydi(
+        sorgu=sorgu_url,
+        baslik=baslik,
+        isteyen=kullanici,
+        kanal=guild.system_channel,
+        thumbnail=bilgi.get("thumbnail"),
+        sure=_sure_metni(bilgi.get("duration")),
+    )
+
+    sira = _sira_al(guild.id)
+    sira.kuyruk.append(kayit)
+
+    if sira.simdi_calan is None and not ses_client.is_playing() and not ses_client.is_paused():
+        await _sonrakini_cal(guild)
+
+    return {"ok": True, "baslik": baslik}
+
+
+def _web_oturum_kur(user_id: int) -> str:
+    """Yeni oturum token'ı oluşturur ve döndürür."""
+    token = os.urandom(24).hex()
+    _web_oturumlar[token] = user_id
+    _web_oturum_tarih[token] = time.time()
+    return token
+
+
+async def _web_oauth_token_al(kod: str) -> dict | None:
+    """Discord OAuth2 authorization code'unu access token'a çevirir."""
+    veri = {
+        "client_id": DISCORD_CLIENT_ID,
+        "client_secret": DISCORD_CLIENT_SECRET,
+        "grant_type": "authorization_code",
+        "code": kod,
+        "redirect_uri": f"{PUBLIK_URL}/callback",
+    }
+    async with aiohttp.ClientSession() as oturum:
+        async with oturum.post("https://discord.com/api/oauth2/token", data=veri) as yanit:
+            if yanit.status != 200:
+                return None
+            return await yanit.json()
+
+
+async def _web_oauth_kullanici(token: str) -> dict | None:
+    """Access token ile kullanıcı bilgisini çeker."""
+    async with aiohttp.ClientSession() as oturum:
+        async with oturum.get(
+            "https://discord.com/api/users/@me", headers={"Authorization": f"Bearer {token}"}
+        ) as yanit:
+            if yanit.status != 200:
+                return None
+            return await yanit.json()
+
+
+WEB_HTML = """<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DVRM Müzik Paneli</title>
+<style>
+:root { --bg:#0f1220; --panel:#171a2b; --panel2:#1e2238; --accent:#5865f2; --text:#e7e9f4; --muted:#8b8fa8; }
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family:'Segoe UI',system-ui,sans-serif; background:linear-gradient(160deg,#0f1220,#141830); color:var(--text); min-height:100vh; }
+.wrap { max-width:960px; margin:0 auto; padding:24px 16px 60px; }
+header { display:flex; align-items:center; justify-content:space-between; margin-bottom:22px; }
+header h1 { font-size:20px; }
+header h1 span { color:var(--accent); }
+.usermenu { display:flex; align-items:center; gap:12px; font-size:14px; color:var(--muted); }
+.usermenu img { width:34px; height:34px; border-radius:50%; }
+a.btn, button.btn { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:10px 16px; font-size:14px; cursor:pointer; text-decoration:none; }
+button.btn:disabled { opacity:.5; cursor:not-allowed; }
+button.ghost { background:transparent; color:var(--muted); border:1px solid #33385a; }
+.card { background:var(--panel); border-radius:14px; padding:18px; margin-bottom:16px; border:1px solid #23284a; }
+.now { display:flex; gap:16px; align-items:center; }
+.now img { width:96px; height:96px; border-radius:10px; object-fit:cover; background:#2a2f52; }
+.now .info h2 { font-size:16px; margin-bottom:4px; }
+.now .info p { color:var(--muted); font-size:13px; }
+.badges { display:flex; gap:8px; margin-top:10px; }
+.badge { padding:4px 10px; border-radius:20px; font-size:12px; }
+.badge.playing { background:#2ecc7122; color:#2ecc71; border:1px solid #2ecc7155; }
+.badge.paused { background:#f39c1222; color:#f39c12; border:1px solid #f39c1255; }
+.badge.idle { background:#8b8fa822; color:var(--muted); border:1px solid #8b8fa855; }
+.controls { display:flex; gap:10px; margin-top:14px; flex-wrap:wrap; }
+.searchbar { display:flex; gap:10px; }
+.searchbar input { flex:1; background:var(--panel2); border:1px solid #33385a; border-radius:8px; padding:11px 14px; color:var(--text); font-size:14px; outline:none; }
+.results { margin-top:12px; display:flex; flex-direction:column; gap:8px; }
+.res-item { display:flex; align-items:center; gap:12px; background:var(--panel2); padding:10px; border-radius:10px; cursor:pointer; transition:background .15s; }
+.res-item:hover { background:#262b4a; }
+.res-item img { width:48px; height:48px; border-radius:6px; object-fit:cover; }
+.res-item .r-title { font-size:13px; }
+.res-item .r-sub { color:var(--muted); font-size:12px; }
+.siralist { display:flex; flex-direction:column; gap:8px; margin-top:10px; }
+.siralist .item { display:flex; align-items:center; gap:10px; background:var(--panel2); padding:8px 12px; border-radius:8px; font-size:13px; }
+.siralist .n { width:24px; color:var(--muted); text-align:center; }
+.siralist .t { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.siralist .s { color:var(--muted); font-size:12px; white-space:nowrap; }
+.empty { color:var(--muted); font-size:14px; text-align:center; padding:20px; }
+.loginbox { text-align:center; padding:60px 20px; }
+.loginbox h2 { font-size:22px; margin-bottom:8px; }
+.loginbox p { color:var(--muted); margin-bottom:24px; }
+.sel { background:var(--panel2); border:1px solid #33385a; color:var(--text); border-radius:8px; padding:10px; font-size:14px; }
+.loading { color:var(--muted); font-size:13px; text-align:center; padding:8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <h1>🎧 <span>DVRM</span> Müzik Paneli</h1>
+  <div class="usermenu" id="usermenu"></div>
+</header>
+
+<div id="app"></div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+let simdi = null;
+let guvenli = true;
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (r.status === 401) { location.href = '/login'; throw new Error('401'); }
+  const j = await r.json().catch(() => ({}));
+  if (j.hata) throw new Error(j.hata);
+  return j;
+}
+
+function renderLogin() {
+  $('#app').innerHTML = `
+    <div class="loginbox card">
+      <h2>🎵 Müzik Kontrol Paneli</h2>
+      <p>Şarkı çalmak ve sırayı yönetmek için Discord hesabınla giriş yap.<br>Sunucuda yönetici/moderatör rolünün olması gerekir.</p>
+      <a class="btn" href="/login">Discord ile giriş yap</a>
+    </div>`;
+}
+
+function renderPanel(durum) {
+  simdi = durum;
+  let badge = durum.duraklatildi ? '<span class="badge paused">⏸️ Duraklatıldı</span>'
+            : durum.caliyor ? '<span class="badge playing">▶️ Çalıyor</span>'
+            : '<span class="badge idle">⏹️ Boşta</span>';
+
+  let nowHtml = '<div class="empty">Şu anda çalan şarkı yok.</div>';
+  if (durum.simdi) {
+    const s = durum.simdi;
+    nowHtml = `<div class="now">
+      <img src="${esc(s.thumbnail)}" onerror="this.style.display='none'">
+      <div class="info">
+        <h2>${esc(s.baslik)}</h2>
+        <p>${esc(s.sure)} · istek: ${esc(s.isteyen)}</p>
+        ${badge}
+      </div>
+    </div>`;
+  }
+
+  let queueHtml = '<div class="empty">Sırada şarkı yok.</div>';
+  if (durum.kuyruk.length) {
+    queueHtml = `<div class="siralist">` + durum.kuyruk.map((k,i) =>
+      `<div class="item"><span class="n">${i+1}</span><span class="t">${esc(k.baslik)}</span>
+       <span class="s">${esc(k.sure)} · ${esc(k.isteyen)}</span></div>`).join('') + `</div>`;
+  }
+
+  const chans = (durum.kanallar||[]).map(c =>
+    `<option value="${c.id}">${esc(c.ad)} (${c.kisi})</option>`).join('');
+
+  $('#app').innerHTML = `
+    <div class="card">
+      <h2 style="font-size:15px;margin-bottom:10px">🎧 Şimdi Çalıyor</h2>
+      ${nowHtml}
+      <div class="controls">
+        <button class="btn" id="btnSkip" ${!durum.simdi?'disabled':''}>⏭️ Geç</button>
+        <button class="btn" id="btnPause" ${!(durum.caliyor&&!durum.duraklatildi)?'disabled':''}>⏸️ Duraklat</button>
+        <button class="btn" id="btnResume" ${!durum.duraklatildi?'disabled':''}>▶️ Devam</button>
+        <button class="btn ghost" id="btnStop" ${!durum.simdi?'disabled':''}>⏹️ Durdur</button>
+        <select class="sel" id="selChan">${chans}</select>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2 style="font-size:15px;margin-bottom:10px">🔍 Şarkı Ara ve Ekle</h2>
+      <div class="searchbar">
+        <input id="q" placeholder="Şarkı adı veya YouTube linki..." onkeydown="if(event.key==='Enter')ara()">
+        <button class="btn" id="btnAra">Ara</button>
+      </div>
+      <div class="results" id="results"></div>
+    </div>
+
+    <div class="card">
+      <h2 style="font-size:15px;margin-bottom:10px">📜 Sıra (${durum.kuyruk.length})</h2>
+      ${queueHtml}
+    </div>`;
+
+  $('#btnSkip').onclick = async e => { e.target.disabled = true; try { await api('/api/atla',{method:'POST'}); } catch{} setTimeout(tazele,1500); };
+  $('#btnPause').onclick = async e => { try { await api('/api/duraklat',{method:'POST'}); tazele(); } catch{} };
+  $('#btnResume').onclick = async e => { try { await api('/api/devam',{method:'POST'}); tazele(); } catch{} };
+  $('#btnStop').onclick = async e => { e.target.disabled = true; try { await api('/api/durdur',{method:'POST'}); } catch{} setTimeout(tazele,1500); };
+}
+
+async function ara() {
+  const q = $('#q').value.trim();
+  const box = $('#results');
+  if (!q) return;
+  box.innerHTML = '<div class="loading">Aranıyor...</div>';
+  try {
+    const j = await api('/api/ara?q=' + encodeURIComponent(q));
+    if (!j.sonuclar.length) { box.innerHTML = '<div class="loading">Sonuç bulunamadı.</div>'; return; }
+    box.innerHTML = j.sonuclar.map(s => `
+      <div class="res-item" onclick="ekle('${encodeURIComponent(s.sorgu)}')">
+        <img src="${esc(s.thumbnail)}" onerror="this.style.display='none'">
+        <div><div class="r-title">${esc(s.baslik)}</div>
+        <div class="r-sub">${esc(s.sure)} · ${esc(s.kaynak)}</div></div>
+      </div>`).join('');
+  } catch (e) { box.innerHTML = '<div class="loading">Arama hatası: ' + esc(e.message) + '</div>'; }
+}
+
+async function ekle(sorgu) {
+  const box = $('#results');
+  box.innerHTML = '<div class="loading">Kuyruğa ekleniyor...</div>';
+  try {
+    const j = await api('/api/oynat', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({sorgu}) });
+    box.innerHTML = '<div class="loading">✅ ' + esc(j.baslik || 'Eklendi') + '</div>';
+    setTimeout(tazele, 1000);
+  } catch (e) { box.innerHTML = '<div class="loading">Hata: ' + esc(e.message) + '</div>'; }
+}
+
+async function tazele() {
+  try {
+    const j = await api('/api/durum');
+    renderPanel(j);
+  } catch (e) { /* 401 yönlendirmesi api() içinde yapılıyor */ }
+}
+
+async function init() {
+  try {
+    const me = await api('/api/me');
+    $('#usermenu').innerHTML = `
+      <img src="${esc(me.avatar)}" onerror="this.style.display='none'">
+      <span>${esc(me.ad)}</span>
+      <a class="btn ghost" href="/cikis">Çıkış</a>`;
+    tazele();
+    setInterval(tazele, 3000);
+  } catch (e) {
+    renderLogin();
+  }
+}
+init();
+</script>
+</body>
+</html>
+"""
+
+
+async def _web_index(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    """Ana sayfa: oturum varsa panel, yoksa giriş ekranı."""
+    if _web_cookie_al(request) is None:
+        return aiohttp.web.Response(text=WEB_HTML, content_type="text/html")
+    return aiohttp.web.Response(text=WEB_HTML, content_type="text/html")
+
+
+async def _web_login(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    if _web_cookie_al(request) is not None:
+        return aiohttp.web.HTTPFound("/")
+    if not DISCORD_CLIENT_ID:
+        return aiohttp.web.Response(text="DISCORD_CLIENT_ID ve DISCORD_CLIENT_SECRET ayarlı değil. Railway'de bu değişkenleri ekle.", content_type="text/plain")
+    yetki_url = (
+        "https://discord.com/api/oauth2/authorize"
+        f"?client_id={DISCORD_CLIENT_ID}"
+        "&response_type=code"
+        "&scope=identify%20guilds"
+        f"&redirect_uri={aiohttp.helpers.quote(f'{PUBLIK_URL}/callback', safe='')}"
+    )
+    return aiohttp.web.HTTPFound(yetki_url)
+
+
+async def _web_callback(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    kod = request.query.get("code")
+    hata = request.query.get("error")
+    if hata:
+        return aiohttp.web.Response(text=f"Giriş hatası: {hata}", content_type="text/plain")
+    if not kod:
+        return aiohttp.web.HTTPFound("/login")
+
+    token_bilgi = await _web_oauth_token_al(kod)
+    if not token_bilgi:
+        return aiohttp.web.Response(text="OAuth token alınamadı.", content_type="text/plain")
+
+    kullanici = await _web_oauth_kullanici(token_bilgi.get("access_token", ""))
+    if not kullanici:
+        return aiohttp.web.Response(text="Kullanıcı bilgisi alınamadı.", content_type="text/plain")
+
+    user_id = int(kullanici["id"])
+
+    # Kullanıcı bu botun olduğu HERHANGİ bir sunucuda moderator mü?
+    yetkili_sunucu = None
+    for guild in bot.guilds:
+        if _web_kullanici_yetkili(guild, user_id):
+            yetkili_sunucu = guild
+            break
+
+    if yetkili_sunucu is None:
+        return aiohttp.web.Response(
+            text="Bu paneli kullanmak için sunuculardan birinde yönetici/moderatör rolüne sahip olmalısın.",
+            content_type="text/plain",
+        )
+
+    token = _web_oturum_kur(user_id)
+    yanit = aiohttp.web.HTTPFound("/")
+    yanit.set_cookie("dvrms", token, max_age=WEB_SESSION_SANIYE, httponly=True, samesite="lax")
+    return yanit
+
+
+async def _web_cikis(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    token = request.cookies.get("dvrms")
+    if token:
+        _web_oturumlar.pop(token, None)
+        _web_oturum_tarih.pop(token, None)
+    yanit = aiohttp.web.HTTPFound("/")
+    yanit.del_cookie("dvrms")
+    return yanit
+
+
+async def _web_me(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    user_id = _web_cookie_al(request)
+    if user_id is None:
+        return aiohttp.web.json_response({"hata": "yetki"}, status=401)
+    kullanici = bot.get_user(user_id)
+    if kullanici is None:
+        return aiohttp.web.json_response({"hata": "yetki"}, status=401)
+    avatar = kullanici.display_avatar.url if kullanici.display_avatar else ""
+    return aiohttp.web.json_response({"ad": kullanici.name, "avatar": avatar})
+
+
+def _web_hedef_guild(request: aiohttp.web.Request) -> tuple[discord.Guild, discord.Member] | None:
+    """Oturumdaki kullanıcının yetkili olduğu ilk sunucuyu döndürür."""
+    user_id = _web_cookie_al(request)
+    if user_id is None:
+        return None
+    for guild in bot.guilds:
+        uye = guild.get_member(user_id)
+        if uye is not None and any(r.name in MODERATOR_ROL_ADLARI for r in uye.roles):
+            return guild, uye
+    return None
+
+
+async def _web_durum(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    hedef = _web_hedef_guild(request)
+    if hedef is None:
+        return aiohttp.web.json_response({"hata": "yetki"}, status=401)
+    guild, _ = hedef
+    return aiohttp.web.json_response(_web_durum_json(guild))
+
+
+async def _web_ara(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    hedef = _web_hedef_guild(request)
+    if hedef is None:
+        return aiohttp.web.json_response({"hata": "yetki"}, status=401)
+    q = request.query.get("q", "").strip()
+    if not q:
+        return aiohttp.web.json_response({"sonuclar": []})
+
+    arama_ayarlari = dict(YTDLP_AYARLARI)
+    arama_ayarlari["default_search"] = "ytsearch5"
+    sonuclar = []
+    try:
+        loop = asyncio.get_running_loop()
+        bilgi = await loop.run_in_executor(None, functools.partial(_sarki_ara, q))
+        if "entries" in bilgi:
+            for giris in bilgi["entries"][:5]:
+                if not giris:
+                    continue
+                sonuclar.append({
+                    "baslik": giris.get("title", "Bilinmiyor"),
+                    "sure": _sure_metni(giris.get("duration")),
+                    "thumbnail": giris.get("thumbnail", ""),
+                    "kaynak": "YouTube",
+                    "sorgu": giris.get("webpage_url", ""),
+                })
+    except Exception:
+        pass
+    return aiohttp.web.json_response({"sonuclar": sonuclar})
+
+
+async def _web_oynat_ep(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    hedef = _web_hedef_guild(request)
+    if hedef is None:
+        return aiohttp.web.json_response({"hata": "yetki"}, status=401)
+    guild, kullanici = hedef
+    try:
+        veri = await request.json()
+    except Exception:
+        return aiohttp.web.json_response({"hata": "Geçersiz istek."})
+    sorgu = (veri.get("sorgu") or "").strip()
+    if not sorgu:
+        return aiohttp.web.json_response({"hata": "Sorgu boş."})
+    sonuc = await _web_oynat(guild, sorgu, kullanici)
+    return aiohttp.web.json_response(sonuc)
+
+
+async def _web_atla(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    hedef = _web_hedef_guild(request)
+    if hedef is None:
+        return aiohttp.web.json_response({"hata": "yetki"}, status=401)
+    guild, _ = hedef
+    ses_client = discord.utils.get(bot.voice_clients, guild=guild)
+    if ses_client is not None and (ses_client.is_playing() or ses_client.is_paused()):
+        ses_client.stop()
+    return aiohttp.web.json_response({"ok": True})
+
+
+async def _web_duraklat(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    hedef = _web_hedef_guild(request)
+    if hedef is None:
+        return aiohttp.web.json_response({"hata": "yetki"}, status=401)
+    guild, _ = hedef
+    ses_client = discord.utils.get(bot.voice_clients, guild=guild)
+    if ses_client is not None and ses_client.is_playing():
+        ses_client.pause()
+    return aiohttp.web.json_response({"ok": True})
+
+
+async def _web_devam(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    hedef = _web_hedef_guild(request)
+    if hedef is None:
+        return aiohttp.web.json_response({"hata": "yetki"}, status=401)
+    guild, _ = hedef
+    ses_client = discord.utils.get(bot.voice_clients, guild=guild)
+    if ses_client is not None and ses_client.is_paused():
+        ses_client.resume()
+    return aiohttp.web.json_response({"ok": True})
+
+
+async def _web_durdur(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    hedef = _web_hedef_guild(request)
+    if hedef is None:
+        return aiohttp.web.json_response({"hata": "yetki"}, status=401)
+    guild, _ = hedef
+    sira = _sira_al(guild.id)
+    sira.kuyruk.clear()
+    sira.simdi_calan = None
+    ses_client = discord.utils.get(bot.voice_clients, guild=guild)
+    if ses_client is not None:
+        if ses_client.is_playing() or ses_client.is_paused():
+            ses_client.stop()
+        try:
+            await ses_client.disconnect()
+        except discord.HTTPException:
+            pass
+    return aiohttp.web.json_response({"ok": True})
+
+
+async def _web_baslat():
+    """aiohttp web sunucusunu bot'un event loop'unda başlatır."""
+    if aiohttp is None:
+        print("aiohttp kurulu değil; web paneli devre dışı.")
+        return
+    app = aiohttp.web.Application()
+    app.router.add_get("/", _web_index)
+    app.router.add_get("/login", _web_login)
+    app.router.add_get("/callback", _web_callback)
+    app.router.add_get("/cikis", _web_cikis)
+    app.router.add_get("/api/me", _web_me)
+    app.router.add_get("/api/durum", _web_durum)
+    app.router.add_get("/api/ara", _web_ara)
+    app.router.add_post("/api/oynat", _web_oynat_ep)
+    app.router.add_post("/api/atla", _web_atla)
+    app.router.add_post("/api/duraklat", _web_duraklat)
+    app.router.add_post("/api/devam", _web_devam)
+    app.router.add_post("/api/durdur", _web_durdur)
+
+    runner = aiohttp.web.AppRunner(app)
+    await runner.setup()
+    site = aiohttp.web.TCPSite(runner, "0.0.0.0", WEB_PORT)
+    await site.start()
+    print(f"Web paneli çalışıyor: {PUBLIK_URL}")
 
 
 if __name__ == "__main__":
