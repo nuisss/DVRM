@@ -138,6 +138,7 @@ def _varsayilan_veri() -> dict:
         "cekilisler": {},  # "mesaj_id" -> çekiliş kaydı
         "sabit_kanal": {}, # "guild_id" -> 7/24 sabit ses kanalı id'si
         "sayac": {},      # "guild_id" -> {"uye": {"kanal_id","ad"}, "ses": {...}}
+        "duyuru_kapali": {},  # "guild_id:user_id" -> True (genel duyuru almak istemeyenler)
     }
 
 
@@ -1868,8 +1869,90 @@ async def koruma(interaction: discord.Interaction, ozellik: str = None, acik: bo
 
 
 # ============================================
-# LEVEL / XP KOMUTLARI
+# GENEL DUYURU (TOPLU DM)
 # ============================================
+DUYURU_ISLEM = None  # aktif duyuru: {"guild_id": int, "basladi": float, "kalan": list, "toplam": int}
+
+
+@bot.tree.command(name="genelduyuru", description="Sunucudaki tüm üyelere DM ile toplu duyuru gönderir.")
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.describe(
+    mesaj="Gönderilecek duyuru mesajı",
+    onay="Onay istemesi için True bırak (varsayılan)",
+)
+async def genelduyuru(interaction: discord.Interaction, mesaj: str, onay: bool = True):
+    if interaction.guild is None:
+        await interaction.response.send_message("Bu komut sadece sunucuda kullanılabilir.", ephemeral=True)
+        return
+
+    hedefler = [m for m in interaction.guild.members if not m.bot]
+    kapali = _veri.get("duyuru_kapali", {})
+    acik_hedfler = [m for m in hedefler if not kapali.get(f"{interaction.guild.id}:{m.id}")]
+    if not acik_hedfler:
+        await interaction.response.send_message("📭 Gönderilebilecek üye yok.", ephemeral=True)
+        return
+
+    ozet = f"📣 **{len(acik_hedfler)}** üyeye DM gönderilecek. (Toplam {len(hedefler)} üye, {len(hedefler) - len(acik_hedfler)} kişi duyuruları kapattı)\n\n📝 **Mesaj:**\n{mesaj}"
+
+    if not onay:
+        await interaction.response.defer()
+        await _duyuru_gonder(interaction, mesaj, acik_hedfler)
+        return
+
+    view = OnayView(
+        lambda i: _duyuru_onay(i, mesaj, acik_hedfler),
+        lambda i: i.response.edit_message(content="❌ Duyuru iptal edildi.", view=None),
+    )
+    await interaction.response.send_message(ozet, view=view)
+
+
+async def _duyuru_onay(interaction: discord.Interaction, mesaj: str, hedefler: list) -> None:
+    await interaction.response.edit_message(content="📨 Duyuru gönderiliyor...", view=None)
+    await _duyuru_gonder(interaction, mesaj, hedefler)
+
+
+async def _duyuru_gonder(interaction: discord.Interaction, mesaj: str, hedefler: list) -> None:
+    global DUYURU_ISLEM
+    DUYURU_ISLEM = {"guild_id": interaction.guild.id, "basladi": time.time(), "kalan": hedefler, "toplam": len(hedefler)}
+    basarili = 0
+    karsi_tara = interaction.user.name if interaction.user else "Bot"
+    embed_metni = f"📣 **{interaction.guild.name}** sunucusundan duyuru:\n\n{mesaj}"
+
+    for uye in hedefler:
+        if DUYURU_ISLEM is None or DUYURU_ISLEM.get("guild_id") != interaction.guild.id:
+            break
+        try:
+            await uye.send(embed_metni)
+            basarili += 1
+        except discord.HTTPException:
+            pass
+        await asyncio.sleep(0.4)
+
+    DUYURU_ISLEM = None
+    durum = "✅" if basarili else "⚠️"
+    embed = discord.Embed(
+        title=f"{durum} Duyuru tamamlandı",
+        description=f"📤 **{basarili}/{len(hedefler)}** üyeye ulaştı.",
+        color=discord.Color.green() if basarili else discord.Color.orange(),
+    )
+    embed.set_footer(text=f"Gönderen: {karsi_tara}")
+    await interaction.edit_original_response(embed=embed)
+
+
+@bot.tree.command(name="duyurukapat", description="Genel duyuruları (DM) kapatır/açar.")
+async def duyurukapat(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Bu komut sadece sunucuda kullanılabilir.", ephemeral=True)
+        return
+    anahtar = f"{interaction.guild.id}:{interaction.user.id}"
+    kapali = _veri.setdefault("duyuru_kapali", {})
+    if kapali.pop(anahtar, None):
+        durum = "açıldı ✅"
+    else:
+        kapali[anahtar] = True
+        durum = "kapatıldı ❌"
+    _veri_kaydet()
+    await interaction.response.send_message(f"🔕 Genel duyurular {durum}.")
 
 @bot.tree.command(name="level", description="Seviyeni veya bir kullanıcının seviyesini gösterir.")
 @app_commands.describe(user="Seviyesi görülecek kullanıcı (boş = kendin)")
@@ -3415,7 +3498,11 @@ function cizYonet(durum) {
         <div class="searchbar">
           <input id="duyuruMetin" placeholder="Duyuru mesajı..." autocomplete="off">
           <select class="sel" id="selDuyuruKanal">${textOptions}</select>
-          <button class="btn" onclick="yonet('duyuru')">Gönder</button>
+          <button class="btn" onclick="yonet('duyuru')">Kanal</button>
+        </div>
+        <div class="searchbar" style="margin-top:8px">
+          <input id="dmduyuruMetin" placeholder="Tüm üyelere DM mesajı..." autocomplete="off">
+          <button class="btn" onclick="yonet('genelduyuru')">📨 DM'le</button>
         </div>
       </div>
       <div class="yn-block">
@@ -3445,9 +3532,13 @@ async function yonet(islem) {
     body.kanal_id = g('selDuyuruKanal');
     body.mesaj = g('duyuruMetin');
   }
+  if (islem === 'genelduyuru') {
+    body.mesaj = g('dmduyuruMetin');
+  }
   try {
     const j = await api('/api/yonet', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
     if (j.hata) alert('⚠️ ' + j.hata);
+    if (j.ok && j.gonderilen !== undefined) alert('📤 ' + j.gonderilen + '/' + j.toplam + ' üyeye DM ulaştı.');
     tazele();
   } catch {}
 }
@@ -3827,6 +3918,25 @@ async def _web_yonet(request: aiohttp.web.Request) -> aiohttp.web.Response:
         except discord.HTTPException as e:
             return aiohttp.web.json_response({"hata": f"Gönderilemedi: {e}"})
         return aiohttp.web.json_response({"ok": True})
+
+    if islem == "genelduyuru":
+        mesaj = (veri.get("mesaj") or "").strip()
+        if not mesaj:
+            return aiohttp.web.json_response({"hata": "Duyuru mesajı boş."})
+        kapali = _veri.get("duyuru_kapali", {})
+        hedefler = [m for m in guild.members if not m.bot and not kapali.get(f"{guild.id}:{m.id}")]
+        if not hedefler:
+            return aiohttp.web.json_response({"ok": True, "gonderilen": 0, "toplam": 0})
+        embed_metni = f"📣 **{guild.name}** sunucusundan duyuru:\n\n{mesaj}"
+        basarili = 0
+        for uye in hedefler:
+            try:
+                await uye.send(embed_metni)
+                basarili += 1
+            except discord.HTTPException:
+                pass
+            await asyncio.sleep(0.4)
+        return aiohttp.web.json_response({"ok": True, "gonderilen": basarili, "toplam": len(hedefler)})
 
     return aiohttp.web.json_response({"hata": "Bilinmeyen işlem."})
 
