@@ -3202,6 +3202,7 @@ button.ghost { background:transparent; color:var(--muted); border:1px solid #333
 <script>
 const $ = s => document.querySelector(s);
 let sonDurum = null;
+let sonSonuclar = [];
 
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -3308,9 +3309,10 @@ async function ara() {
   box.innerHTML = '<div class="loading">Aranıyor...</div>';
   try {
     const j = await api('/api/ara?q=' + encodeURIComponent(q));
-    if (!j.sonuclar.length) { box.innerHTML = '<div class="loading">Sonuç bulunamadı.</div>'; return; }
-    box.innerHTML = j.sonuclar.map(s => `
-      <div class="res-item" onclick="ekle('${encodeURIComponent(s.sorgu)}')">
+    sonSonuclar = j.sonuclar || [];
+    if (!sonSonuclar.length) { box.innerHTML = '<div class="loading">Sonuç bulunamadı.</div>'; return; }
+    box.innerHTML = sonSonuclar.map((s,i) => `
+      <div class="res-item" onclick="ekle(${i})">
         <img src="${esc(s.thumbnail)}" onerror="this.style.display='none'">
         <div><div class="r-title">${esc(s.baslik)}</div>
         <div class="r-sub">${esc(s.sure)} · ${esc(s.kaynak)}</div></div>
@@ -3319,11 +3321,13 @@ async function ara() {
   } catch (e) { box.innerHTML = '<div class="loading">Arama hatası: ' + esc(e.message) + '</div>'; }
 }
 
-async function ekle(sorgu) {
+async function ekle(i) {
   const box = $('#results');
+  const s = sonSonuclar[i];
+  if (!s) return;
   box.innerHTML = '<div class="loading">Kuyruğa ekleniyor...</div>';
   try {
-    const j = await api('/api/oynat', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({sorgu}) });
+    const j = await api('/api/oynat', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({sorgu: s.sorgu}) });
     box.innerHTML = '<div class="loading">✅ ' + esc(j.baslik || 'Eklendi') + '</div>';
     setTimeout(tazele, 1000);
   } catch (e) { box.innerHTML = '<div class="loading">Hata: ' + esc(e.message) + '</div>'; }
