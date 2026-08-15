@@ -1254,7 +1254,10 @@ def _sarki_ara(sorgu: str) -> dict:
     Birden fazla YouTube client'ı dener; başarılı olanın ilk sonucunu döner."""
     bilgi = _sarki_ara_ayarla(YTDLP_AYARLARI, sorgu)
     if "entries" in bilgi:
-        bilgi = bilgi["entries"][0]
+        girisler = bilgi["entries"] or []
+        if not girisler:
+            raise RuntimeError(f"'{sorgu}' için YouTube'da sonuç bulunamadı.")
+        bilgi = girisler[0]
     return bilgi
 
 
