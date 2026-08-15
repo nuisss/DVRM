@@ -1250,12 +1250,41 @@ async def _sabit_ses_kanaline_baglan(guild: discord.Guild, zorla_tasi: bool = Fa
 
 
 def _sarki_ara(sorgu: str) -> dict:
-    """Bloklayıcı yt-dlp aramasını çalıştırır (executor içinde çağrılmalı)."""
-    with yt_dlp.YoutubeDL(YTDLP_AYARLARI) as ydl:
-        bilgi = ydl.extract_info(sorgu, download=False)
-        if "entries" in bilgi:
-            bilgi = bilgi["entries"][0]
-        return bilgi
+    """Bloklayıcı yt-dlp aramasını çalıştırır (executor içinde çağrılmalı).
+    Birden fazla YouTube client'ı dener; başarılı olanın ilk sonucunu döner."""
+    bilgi = _sarki_ara_ayarla(YTDLP_AYARLARI, sorgu)
+    if "entries" in bilgi:
+        bilgi = bilgi["entries"][0]
+    return bilgi
+
+
+def _sarki_ara_ayarla(ayarlar: dict, sorgu: str) -> dict:
+    """Belirli ayarlarla bloklayıcı yt-dlp araması çalıştırır; başarısız olursa
+    farklı YouTube client'larıyla sırayla dener (datacenter IP'lerinde bazı
+    client'lar 'Video unavailable' dönebildiği için)."""
+    dene_clientlar = [None]  # None = ayarlardaki mevcut client'lar
+    if "youtube" in ayarlar.get("extractor_args", {}):
+        mevcut = ayarlar["extractor_args"]["youtube"].get("player_client", [])
+        dene_clientlar += [
+            ["web", "web_embedded"],
+            ["android", "tv"],
+            ["mweb"],
+        ]
+    son_hata = None
+    for clientlar in dene_clientlar:
+        deneme_ayar = dict(ayarlar)
+        if clientlar is not None:
+            deneme_ayar = json.loads(json.dumps(deneme_ayar))
+            deneme_ayar["extractor_args"] = {
+                "youtube": {"player_client": clientlar}
+            }
+        try:
+            with yt_dlp.YoutubeDL(deneme_ayar) as ydl:
+                return ydl.extract_info(sorgu, download=False)
+        except Exception as e:
+            son_hata = e
+            continue
+    raise son_hata
 
 
 def _sure_metni(saniye) -> str:
@@ -3438,7 +3467,10 @@ async def _web_ara(request: aiohttp.web.Request) -> aiohttp.web.Response:
     sonuclar = []
     try:
         loop = asyncio.get_running_loop()
-        bilgi = await loop.run_in_executor(None, functools.partial(_sarki_ara, q))
+        bilgi = await loop.run_in_executor(
+            None,
+            functools.partial(_sarki_ara_ayarla, arama_ayarlari, q),
+        )
         if "entries" in bilgi:
             for giris in bilgi["entries"][:5]:
                 if not giris:
@@ -3450,8 +3482,8 @@ async def _web_ara(request: aiohttp.web.Request) -> aiohttp.web.Response:
                     "kaynak": "YouTube",
                     "sorgu": giris.get("webpage_url", ""),
                 })
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[WEB ARA] sorgu='{q}' hata: {e}")
     return aiohttp.web.json_response({"sonuclar": sonuclar})
 
 
