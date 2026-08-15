@@ -3948,8 +3948,8 @@ async function sozBegen() {
 async function sozKopyala() {
   if (!sozVeri || !sozVeri.sozler) return;
   try {
-    const metin = sozVeri.sozler.map(s => s.metin).join('\n');
-    await navigator.clipboard.writeText(`${sozVeri.baslik}\n${sozVeri.sanatci}\n\n${metin}`);
+    const metin = sozVeri.sozler.map(s => s.metin).join('\\n');
+    await navigator.clipboard.writeText(`${sozVeri.baslik}\\n${sozVeri.sanatci}\\n\\n${metin}`);
     toast('📋 Sözler kopyalandı');
   } catch { toast('Kopyalanamadı', true); }
 }
