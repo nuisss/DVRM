@@ -1324,7 +1324,9 @@ def _yt_hata_cevir(hata: Exception) -> str:
 def _sarki_bitince(guild: discord.Guild, hata: Exception | None):
     """FFmpeg oynatma bitince (ayrı bir thread'den) çağrılır; sıradaki şarkıyı başlatır."""
     if hata:
-        print(f"Oynatma hatası: {hata}")
+        # Taşınma/bağlantı kesintisi gibi hatalarda sırayı bozma: şarkıyı atlama.
+        print(f"Oynatma hatası (sıra korunuyor): {hata}")
+        return
     fut = asyncio.run_coroutine_threadsafe(_sonrakini_cal(guild), bot.loop)
     try:
         fut.result()
@@ -1338,6 +1340,10 @@ async def _sonrakini_cal(guild: discord.Guild):
 
     if ses_client is None or not ses_client.is_connected():
         sira.simdi_calan = None
+        return
+
+    # Zaten bir şarkı çalıyorsa/duraklatıldıysa ikinci kez başlatma (çift tetiklenmeyi önler).
+    if ses_client.is_playing() or ses_client.is_paused():
         return
 
     # Web panelinde seçili bir kanal varsa, şarkı çalmadan önce oraya taşın.
@@ -3667,13 +3673,16 @@ function cizYonet(durum) {
   doldur('selDuyuruKanal', metin);
 
   const sd = $('#sesSlider');
+  const sdv = $('#sesDeger');
   if (sd && y.ses_seviyesi !== undefined && !sd.dataset.kurulu) {
     sd.value = y.ses_seviyesi;
     sd.dataset.kurulu = '1';
-    const sdv = $('#sesDeger');
     if (sdv) sdv.textContent = 'Mevcut seviye: %' + y.ses_seviyesi;
     sd.oninput = () => { if (sdv) sdv.textContent = 'Seviye: %' + sd.value; };
+  } else if (sdv && y.ses_seviyesi !== undefined && !sd.dataset.suruklendi) {
+    sdv.textContent = 'Mevcut seviye: %' + y.ses_seviyesi;
   }
+  if (sd) sd.onchange = () => { sd.dataset.suruklendi = '1'; };
 }
 
 async function sesAyarla() {
@@ -4198,6 +4207,12 @@ async def _web_yonet(request: aiohttp.web.Request) -> aiohttp.web.Response:
         _veri_kaydet()
         ses_client = discord.utils.get(bot.voice_clients, guild=guild)
         if ses_client is not None and ses_client.is_playing():
+            # Mevcut şarkıyı kuyruğun başına geri koy, stop() yeni seviyeyle
+            # yeniden çalmasını tetikler (şarkı atlanmaz).
+            sira = _sira_al(guild.id)
+            if sira.simdi_calan is not None:
+                sira.kuyruk.insert(0, sira.simdi_calan)
+            sira.simdi_calan = None
             ses_client.stop()
         return aiohttp.web.json_response({"ok": True})
 
