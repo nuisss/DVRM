@@ -1340,6 +1340,18 @@ async def _sonrakini_cal(guild: discord.Guild):
         sira.simdi_calan = None
         return
 
+    # Web panelinde seçili bir kanal varsa, şarkı çalmadan önce oraya taşın.
+    secili_id = _web_secili_kanal.get(guild.id)
+    if secili_id and ses_client.channel.id != secili_id:
+        hedef = guild.get_channel(secili_id)
+        if isinstance(hedef, discord.VoiceChannel) and hedef.permissions_for(guild.me).connect:
+            try:
+                await ses_client.move_to(hedef)
+            except (discord.HTTPException, OSError, asyncio.TimeoutError) as e:
+                print(f"Seçili kanala taşınamadı ({guild.name}): {e}")
+        else:
+            _web_secili_kanal.pop(guild.id, None)
+
     if not sira.kuyruk:
         sira.simdi_calan = None
         # Çalınacak şarkı kalmadı, botu tekrar sabit 7/24 ses kanalına gönder.
@@ -3223,7 +3235,7 @@ async def _web_oynat(guild: discord.Guild, sorgu: str, kullanici: discord.Member
             ses_client = await kanal.connect(self_mute=False, self_deaf=True)
         elif ses_client.channel.id != kanal.id:
             await ses_client.move_to(kanal)
-    except (discord.ClientException, discord.HTTPException, OSError) as e:
+    except (discord.ClientException, discord.HTTPException, OSError, asyncio.TimeoutError) as e:
         return {"hata": f"Kanala bağlanılamadı: {e}"}
 
     try:
@@ -4074,14 +4086,14 @@ async def _web_kanal(request: aiohttp.web.Request) -> aiohttp.web.Response:
 
     _web_secili_kanal[guild.id] = int(kanal_id)
 
-    # Bot zaten sesliyse ve çalmıyorsa hemen taşınır; çalıyorsa sıradaki şarkı
-    # o kanalda başlar (rahatsız etmemek için anında taşınmaz).
+    # Bot sesliyse her durumda (çalarken dahil) taşınır; taşınan ses kaldığı
+    # yerden devam eder. Bağlı değilse seçim kaydedilir, ilk şarkıda bağlanır.
     ses_client = discord.utils.get(bot.voice_clients, guild=guild)
-    if ses_client is not None and ses_client.is_connected() and not (ses_client.is_playing() or ses_client.is_paused()):
+    if ses_client is not None and ses_client.is_connected():
         try:
             if ses_client.channel.id != kanal.id:
                 await ses_client.move_to(kanal)
-        except (discord.HTTPException, OSError) as e:
+        except (discord.HTTPException, OSError, asyncio.TimeoutError) as e:
             return aiohttp.web.json_response({"hata": f"Taşınamadı: {e}"})
 
     return aiohttp.web.json_response({"ok": True, "kanal": kanal.name})
