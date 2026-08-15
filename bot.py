@@ -3049,6 +3049,26 @@ def _web_durum_json(guild: discord.Guild) -> dict:
         if isinstance(kanal, discord.VoiceChannel):
             secili = kanal.name
 
+    koruma = _veri.get("koruma", {}).get(str(guild.id), {})
+    sayaclar = _veri.get("sayac", {}).get(str(guild.id), {})
+
+    def _kanal_adi_by_id(kanal_id) -> str | None:
+        if not kanal_id:
+            return None
+        kanal = guild.get_channel(int(kanal_id))
+        return kanal.name if kanal else None
+
+    uyari_listesi = []
+    for kisi_key, uyarilar in _veri.get("uyarilar", {}).items():
+        kid, _, uid = kisi_key.partition(":")
+        if int(kid) != guild.id:
+            continue
+        uye = guild.get_member(int(uid))
+        uyari_listesi.append({
+            "kullanici": uye.name if uye else f"ID:{uid}",
+            "adet": len(uyarilar),
+        })
+
     return {
         "guild": guild.name,
         "ses_kanali": ses_client.channel.name if ses_client and ses_client.is_connected() else None,
@@ -3061,6 +3081,27 @@ def _web_durum_json(guild: discord.Guild) -> dict:
             {"id": str(vc.id), "ad": vc.name, "kisi": len(vc.members)}
             for vc in guild.voice_channels if vc.permissions_for(guild.me).connect
         ],
+        "metin_kanallar": [
+            {"id": str(tc.id), "ad": tc.name}
+            for tc in guild.text_channels if tc.permissions_for(guild.me).send_messages
+        ],
+        "yönetim": {
+            "uye_sayisi": guild.member_count or 0,
+            "insan_sayisi": sum(1 for m in guild.members if not m.bot),
+            "bot_sayisi": sum(1 for m in guild.members if m.bot),
+            "kanal_sayisi": len(guild.channels),
+            "metin_kanali": len(guild.text_channels),
+            "ses_kanali": len(guild.voice_channels),
+            "koruma": {
+                oz: bool(koruma.get(oz)) for oz in KORUMA_OZELLIKLERI
+            },
+            "log_kanali": _kanal_adi_by_id(_veri["log_kanali"].get(str(guild.id))),
+            "giris_cikis_kanali": _kanal_adi_by_id(_veri["giris_cikis_kanali"].get(str(guild.id))),
+            "sabit_kanal": _kanal_adi_by_id(_veri.get("sabit_kanal", {}).get(str(guild.id))),
+            "uye_sayaci": sayaclar.get("uye", {}).get("ad"),
+            "ses_sayaci": sayaclar.get("ses", {}).get("ad"),
+            "uyarilar": uyari_listesi[:10],
+        },
     }
 
 
@@ -3202,6 +3243,17 @@ button.ghost { background:transparent; color:var(--muted); border:1px solid #333
 .loginbox h2 { font-size:24px; margin-bottom:10px; color:var(--text); }
 .loginbox p { color:var(--muted); margin-bottom:28px; line-height:1.6; }
 .loading { color:var(--muted); font-size:13px; text-align:center; padding:10px; }
+.yonet-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:14px; }
+.yn-row { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:14px; margin-top:14px; }
+.yn-block { background:var(--panel2); border-radius:12px; padding:14px; }
+.yn-block h3 { font-size:13px; color:var(--muted); margin-bottom:10px; text-transform:uppercase; letter-spacing:.5px; }
+.yn-block p { font-size:13px; margin:4px 0; color:var(--text); }
+.chip { display:inline-block; background:var(--panel2); border:1px solid #33385a; border-radius:8px; padding:5px 10px; font-size:12px; margin:3px 3px 0 0; cursor:pointer; transition:all .15s; }
+.chip:hover { transform:translateY(-1px); }
+.chip.on { background:rgba(87,242,135,.12); border-color:var(--green); color:var(--green); }
+.chip.off { background:rgba(255,99,132,.10); border-color:#ff6384; color:#ff6384; }
+#uyariListe { display:flex; flex-direction:column; gap:4px; max-height:200px; overflow-y:auto; }
+#uyariListe .item { display:flex; justify-content:space-between; background:var(--panel); padding:7px 10px; border-radius:8px; font-size:13px; }
 ::-webkit-scrollbar { width:8px; } ::-webkit-scrollbar-thumb { background:#2a2f52; border-radius:8px; }
 </style>
 </head>
@@ -3282,6 +3334,122 @@ function cizPanel(durum) {
   const chans = (durum.kanallar||[]).map(c =>
     `<option value="${c.id}" ${c.ad === aktifKanal ? 'selected' : ''}>${esc(c.ad)} (${c.kisi})</option>`).join('');
   $('#selChan').innerHTML = chans;
+
+  cizYonet(durum);
+}
+
+function cizYonet(durum) {
+  const y = durum.yönetim;
+  const box = $('#yonet');
+  if (!y || !box) return;
+
+  const koruma = y.koruma || {};
+  const korumaMetin = Object.keys(koruma).map(k =>
+    `<span class="chip ${koruma[k] ? 'on' : 'off'}" onclick="yonetKoruma('${k}','${koruma[k]}')">${esc(k)} ${koruma[k] ? '✅' : '❌'}</span>`
+  ).join(' ');
+
+  const uyarilar = (y.uyarilar || []).map(u =>
+    `<div class="item"><span class="t">${esc(u.kullanici)}</span><span class="s">${u.adet} uyarı</span></div>`
+  ).join('') || '<div class="empty">Uyarı yok.</div>';
+
+  const voiceOptions = (durum.kanallar || []).map(c =>
+    `<option value="${c.id}">${esc(c.ad)}</option>`).join('');
+  const textOptions = (durum.metin_kanallar || []).map(c =>
+    `<option value="${c.id}">#${esc(c.ad)}</option>`).join('');
+
+  box.innerHTML = `
+    <div class="yonet-grid">
+      <div class="yn-block">
+        <h3>🛡️ Koruma</h3>
+        <p>${korumaMetin}</p>
+      </div>
+      <div class="yn-block">
+        <h3>📊 Sunucu</h3>
+        <p>👥 ${y.insan_sayisi} kişi · 🤖 ${y.bot_sayisi} bot · ${y.uye_sayisi} toplam</p>
+        <p>💬 ${y.metin_kanali} metin · 🔊 ${y.ses_kanali} ses</p>
+      </div>
+      <div class="yn-block">
+        <h3>⚙️ Kanal Ayarları</h3>
+        <p>📝 Log: <b>${esc(y.log_kanali || '—')}</b></p>
+        <p>🚪 Giriş/Çıkış: <b>${esc(y.giris_cikis_kanali || '—')}</b></p>
+        <p>🔁 7/24: <b>${esc(y.sabit_kanal || '—')}</b></p>
+        <p>🔢 Üye sayaç: <b>${esc(y.uye_sayaci || '—')}</b> · Ses sayaç: <b>${esc(y.ses_sayaci || '—')}</b></p>
+      </div>
+    </div>
+
+    <div class="yn-row">
+      <div class="yn-block">
+        <h3>🔁 7/24 Ses Kanalı</h3>
+        <div class="searchbar">
+          <select class="sel" id="sel724">${voiceOptions}</select>
+          <button class="btn" onclick="yonet('724')">Uygula</button>
+        </div>
+      </div>
+      <div class="yn-block">
+        <h3>🔢 Sayaç Kur</h3>
+        <div class="searchbar">
+          <select class="sel" id="selSayacTur">
+            <option value="uye">Üye</option>
+            <option value="ses">Ses</option>
+          </select>
+          <select class="sel" id="selSayacKanal">${voiceOptions}</select>
+          <button class="btn" onclick="yonet('sayackur')">Kur</button>
+        </div>
+      </div>
+      <div class="yn-block">
+        <h3>📝 Kanal Ata</h3>
+        <div class="searchbar">
+          <select class="sel" id="selKanalTur">
+            <option value="log">Log</option>
+            <option value="giriscikis">Giriş/Çıkış</option>
+          </select>
+          <select class="sel" id="selKanalKanal">${textOptions}</select>
+          <button class="btn" onclick="yonet('kanal_ayarla')">Ata</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="yn-row">
+      <div class="yn-block">
+        <h3>📣 Duyuru Gönder</h3>
+        <div class="searchbar">
+          <input id="duyuruMetin" placeholder="Duyuru mesajı..." autocomplete="off">
+          <select class="sel" id="selDuyuruKanal">${textOptions}</select>
+          <button class="btn" onclick="yonet('duyuru')">Gönder</button>
+        </div>
+      </div>
+      <div class="yn-block">
+        <h3>⚠️ Uyarılar</h3>
+        <div id="uyariListe">${uyarilar}</div>
+      </div>
+    </div>`;
+}
+
+async function yonetKoruma(oz, acik) {
+  try {
+    await api('/api/yonet', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({islem:'koruma', ozellik:oz, acik: acik !== 'true'}) });
+    tazele();
+  } catch {}
+}
+
+async function yonet(islem) {
+  const g = id => { const el = document.getElementById(id); return el ? el.value : null; };
+  const body = { islem };
+  if (islem === '724' || islem === 'sayackur') body.kanal_id = g('sel724') || g('selSayacKanal');
+  if (islem === 'sayackur') body.tur = g('selSayacTur');
+  if (islem === 'kanal_ayarla') {
+    body.tur = g('selKanalTur');
+    body.kanal_id = g('selKanalKanal');
+  }
+  if (islem === 'duyuru') {
+    body.kanal_id = g('selDuyuruKanal');
+    body.mesaj = g('duyuruMetin');
+  }
+  try {
+    const j = await api('/api/yonet', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    if (j.hata) alert('⚠️ ' + j.hata);
+    tazele();
+  } catch {}
 }
 
 function cizIskeler() {
@@ -3310,6 +3478,11 @@ function cizIskeler() {
     <div class="card">
       <h2>📜 Sıra <span class="say" id="siraAdet">0</span></h2>
       <div id="siraListe"><div class="empty">Yükleniyor...</div></div>
+    </div>
+
+    <div class="card">
+      <h2>⚙️ Sunucu Yönetimi</h2>
+      <div id="yonet"><div class="empty">Yükleniyor...</div></div>
     </div>`;
 
   $('#btnSkip').onclick = async e => { e.target.disabled = true; try { await api('/api/atla',{method:'POST'}); } catch{} setTimeout(tazele,1500); };
@@ -3566,6 +3739,98 @@ async def _web_kanal(request: aiohttp.web.Request) -> aiohttp.web.Response:
     return aiohttp.web.json_response({"ok": True, "kanal": kanal.name})
 
 
+async def _web_yonet(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    """Sunucu yönetimi: koruma, sayaç, 7/24, kanal ayarları."""
+    hedef = _web_hedef_guild(request)
+    if hedef is None:
+        return aiohttp.web.json_response({"hata": "yetki"}, status=401)
+    guild, _ = hedef
+    try:
+        veri = await request.json()
+    except Exception:
+        return aiohttp.web.json_response({"hata": "Geçersiz istek."})
+
+    islem = veri.get("islem")
+
+    if islem == "koruma":
+        ozellik = veri.get("ozellik")
+        acik = veri.get("acik")
+        if ozellik not in KORUMA_OZELLIKLERI or not isinstance(acik, bool):
+            return aiohttp.web.json_response({"hata": "Geçersiz koruma ayarı."})
+        ayarlar = _veri["koruma"].setdefault(str(guild.id), {})
+        ayarlar[ozellik] = acik
+        _veri_kaydet()
+        return aiohttp.web.json_response({"ok": True})
+
+    if islem == "sayackur":
+        tur = veri.get("tur")
+        kanal_id = veri.get("kanal_id")
+        if tur not in ("uye", "ses") or not kanal_id:
+            return aiohttp.web.json_response({"hata": "Tür veya kanal eksik."})
+        kanal = guild.get_channel(int(kanal_id))
+        if not isinstance(kanal, discord.VoiceChannel):
+            return aiohttp.web.json_response({"hata": "Geçersiz ses kanalı."})
+        sayaclar = _veri["sayac"].setdefault(str(guild.id), {})
+        sayaclar[tur] = {"kanal_id": str(kanal.id), "ad": kanal.name}
+        _veri_kaydet()
+        await _sayac_kanali_guncelle(kanal, tur)
+        return aiohttp.web.json_response({"ok": True})
+
+    if islem == "sayackapat":
+        tur = veri.get("tur")
+        sayaclar = _veri["sayac"].setdefault(str(guild.id), {})
+        if tur in sayaclar:
+            del sayaclar[tur]
+            _veri_kaydet()
+        return aiohttp.web.json_response({"ok": True})
+
+    if islem == "724":
+        kanal_id = veri.get("kanal_id")
+        if not kanal_id:
+            return aiohttp.web.json_response({"hata": "Kanal seçilmedi."})
+        kanal = guild.get_channel(int(kanal_id))
+        if not isinstance(kanal, discord.VoiceChannel):
+            return aiohttp.web.json_response({"hata": "Geçersiz ses kanalı."})
+        _veri.setdefault("sabit_kanal", {})[str(guild.id)] = str(kanal.id)
+        _veri_kaydet()
+        try:
+            await _sabit_ses_kanaline_baglan(guild, zorla_tasi=True)
+        except Exception as e:
+            print(f"7/24 bağlanamadı ({guild.name}): {e}")
+        return aiohttp.web.json_response({"ok": True})
+
+    if islem == "kanal_ayarla":
+        tur = veri.get("tur")
+        kanal_id = veri.get("kanal_id")
+        if tur not in ("log", "giriscikis"):
+            return aiohttp.web.json_response({"hata": "Bilinmeyen kanal türü."})
+        if kanal_id:
+            kanal = guild.get_channel(int(kanal_id))
+            if not isinstance(kanal, discord.TextChannel):
+                return aiohttp.web.json_response({"hata": "Geçersiz metin kanalı."})
+            _veri[tur + "_kanali"][str(guild.id)] = str(kanal.id)
+        else:
+            _veri[tur + "_kanali"].pop(str(guild.id), None)
+        _veri_kaydet()
+        return aiohttp.web.json_response({"ok": True})
+
+    if islem == "duyuru":
+        kanal_id = veri.get("kanal_id")
+        mesaj = (veri.get("mesaj") or "").strip()
+        if not kanal_id or not mesaj:
+            return aiohttp.web.json_response({"hata": "Kanal veya mesaj eksik."})
+        kanal = guild.get_channel(int(kanal_id))
+        if not isinstance(kanal, discord.TextChannel):
+            return aiohttp.web.json_response({"hata": "Geçersiz metin kanalı."})
+        try:
+            await kanal.send(mesaj)
+        except discord.HTTPException as e:
+            return aiohttp.web.json_response({"hata": f"Gönderilemedi: {e}"})
+        return aiohttp.web.json_response({"ok": True})
+
+    return aiohttp.web.json_response({"hata": "Bilinmeyen işlem."})
+
+
 async def _web_atla(request: aiohttp.web.Request) -> aiohttp.web.Response:
     hedef = _web_hedef_guild(request)
     if hedef is None:
@@ -3633,6 +3898,7 @@ async def _web_baslat():
     app.router.add_get("/api/ara", _web_ara)
     app.router.add_post("/api/oynat", _web_oynat_ep)
     app.router.add_post("/api/kanal", _web_kanal)
+    app.router.add_post("/api/yonet", _web_yonet)
     app.router.add_post("/api/atla", _web_atla)
     app.router.add_post("/api/duraklat", _web_duraklat)
     app.router.add_post("/api/devam", _web_devam)
