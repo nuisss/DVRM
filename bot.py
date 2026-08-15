@@ -3790,6 +3790,8 @@ function cizPanel(durum) {
     `<option value="${c.id}" ${c.ad === aktifKanal ? 'selected' : ''}>${esc(c.ad)} (${c.kisi})</option>`).join('');
   $('#selChan').innerHTML = chans;
 
+  if (durum.simdi && durum.simdi.sorgu) sozOnbellekYukle(durum.simdi.sorgu);
+
   cizYonet(durum);
 }
 
@@ -3855,6 +3857,15 @@ function cizYonet(durum) {
 let sozVeri = null;
 let sozAktifIdx = -1;
 let sozTimer = null;
+let sozOnbellek = { sorgu: null, veri: null };
+
+async function sozOnbellekYukle(sorgu) {
+  if (!sorgu || sozOnbellek.sorgu === sorgu) return;
+  try {
+    const j = await api('/api/sozler?sorgu=' + encodeURIComponent(sorgu));
+    sozOnbellek = { sorgu: sorgu, veri: j };
+  } catch {}
+}
 
 async function sozAc() {
   const kart = $('#sozKart');
@@ -3865,13 +3876,19 @@ async function sozAc() {
   kart.innerHTML = '<div class="soz-yuk">🎤 Sözler aranıyor...</div>';
   const sorgu = sonDurum.simdi.sorgu;
   try {
-    const j = await api('/api/sozler?sorgu=' + encodeURIComponent(sorgu));
+    let j = null;
+    if (sozOnbellek.sorgu === sorgu && sozOnbellek.veri) {
+      j = sozOnbellek.veri;
+    } else {
+      j = await api('/api/sozler?sorgu=' + encodeURIComponent(sorgu));
+      sozOnbellek = { sorgu: sorgu, veri: j };
+    }
     if (!j.ok || !j.sozler || !j.sozler.length) throw new Error('Bu şarkı için söz bulunamadı.');
     sozVeri = j;
     sozAktifIdx = -1;
     sozKartRender(j);
     if (sozTimer) clearInterval(sozTimer);
-    sozTimer = setInterval(sozTik, 1000);
+    sozTimer = setInterval(sozTik, 500);
   } catch (e) {
     kart.innerHTML = '<div class="soz-yuk">⚠️ ' + esc(e.message) + '</div>';
     setTimeout(() => sozKapat(), 3200);
