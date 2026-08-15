@@ -2953,10 +2953,14 @@ def _web_cookie_al(request: aiohttp.web.Request) -> int | None:
 
 
 def _web_kullanici_yetkili(guild: discord.Guild, user_id: int) -> bool:
-    """Kullanıcının bu sunucuda moderator rolü var mı?"""
+    """Kullanıcının bu sunucuda moderator rolü / sahiplik / admin izni var mı?"""
+    if guild.owner_id == user_id:
+        return True
     uye = guild.get_member(user_id)
     if uye is None:
         return False
+    if uye.guild_permissions.administrator:
+        return True
     return any(r.name in MODERATOR_ROL_ADLARI for r in uye.roles)
 
 
@@ -3377,7 +3381,7 @@ def _web_hedef_guild(request: aiohttp.web.Request) -> tuple[discord.Guild, disco
         return None
     for guild in bot.guilds:
         uye = guild.get_member(user_id)
-        if uye is not None and any(r.name in MODERATOR_ROL_ADLARI for r in uye.roles):
+        if uye is not None and _web_kullanici_yetkili(guild, user_id):
             return guild, uye
     return None
 
