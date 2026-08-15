@@ -683,6 +683,14 @@ async def on_ready():
     except Exception as e:
         print(f"Presence ayarlanamadı: {e}")
 
+    # Web panelini bot'un event loop'unda başlat (bir kez).
+    if not getattr(bot, "_web_basladi", False):
+        bot._web_basladi = True
+        try:
+            bot.loop.create_task(_web_baslat())
+        except Exception as e:
+            print(f"Web paneli başlatılamadı: {e}")
+
     # Devam eden çekilişlerin butonlarını ve süre sayaçlarını geri yükle
     for mid_str, kayit in _veri["cekilisler"].items():
         if kayit.get("bitti"):
