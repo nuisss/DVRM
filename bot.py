@@ -1190,13 +1190,14 @@ class SarkiKaydi:
     şarkı çalınmaya başlarken tazeden çekiliyor."""
 
     def __init__(self, sorgu: str, baslik: str, isteyen: discord.Member, kanal: discord.abc.Messageable,
-                 thumbnail: str | None = None, sure: str | None = None):
+                 thumbnail: str | None = None, sure: str | None = None, sure_sn: float | None = None):
         self.sorgu = sorgu
         self.baslik = baslik
         self.isteyen = isteyen
         self.kanal = kanal
         self.thumbnail = thumbnail
         self.sure = sure
+        self.sure_sn = sure_sn
 
 
 class MuzikSirasi:
@@ -1206,13 +1207,23 @@ class MuzikSirasi:
         self.baslama_zamani: float | None = None      # şarkının başladığı zaman (epoch)
         self.duraklatma_an: float | None = None       # son duraklatma anı (epoch)
         self.toplam_duraklatma: float = 0.0           # toplam duraklatılan süre (sn)
+        self.dongu: int = 0                           # 0=kapalı, 1=şarkı, 2=kuyruk
+        self.dongu_cevir: list[SarkiKaydi] = []       # kuyruk döngüsü için anlık görüntü
+        self.dongu_atlama: bool = False               # skip'te şarkı döngüsünü bastırır
+        self.autoplay: bool = False                   # kuyruk bitince benzer şarkı çal
+        self.gecmis: list[SarkiKaydi] = []            # son çalınanlar (max 25)
 
 
 muzik_siralari: dict[int, MuzikSirasi] = {}  # guild_id -> MuzikSirasi
 
 
 def _sira_al(guild_id: int) -> MuzikSirasi:
-    return muzik_siralari.setdefault(guild_id, MuzikSirasi())
+    sira = muzik_siralari.setdefault(guild_id, MuzikSirasi())
+    if not getattr(sira, "_kuruldu", False):
+        sira._kuruldu = True
+        sira.dongu = int(_veri.get("dongu", {}).get(str(guild_id), 0))
+        sira.autoplay = bool(_veri.get("autoplay", {}).get(str(guild_id), False))
+    return sira
 
 
 def _sira_pozisyonu(sira: MuzikSirasi) -> float:
@@ -1463,6 +1474,11 @@ def _sarki_bitince(guild: discord.Guild, hata: Exception | None):
         # Taşınma/bağlantı kesintisi gibi hatalarda sırayı bozma: şarkıyı atlama.
         print(f"Oynatma hatası (sıra korunuyor): {hata}")
         return
+    sira = _sira_al(guild.id)
+    # Şarkı döngüsü: şarkı doğal olarak bitince (skip değilse) aynısını en başa koy.
+    if sira.dongu == 1 and sira.simdi_calan is not None and not sira.dongu_atlama:
+        sira.kuyruk.insert(0, sira.simdi_calan)
+    sira.dongu_atlama = False
     fut = asyncio.run_coroutine_threadsafe(_sonrakini_cal(guild), bot.loop)
     try:
         fut.result()
@@ -1495,12 +1511,20 @@ async def _sonrakini_cal(guild: discord.Guild):
             _web_secili_kanal.pop(guild.id, None)
 
     if not sira.kuyruk:
+        # Kuyruk döngüsü: anlık görüntüyü geri yükle.
+        if sira.dongu == 2 and sira.dongu_cevir:
+            sira.kuyruk.extend(list(sira.dongu_cevir))
+        # Autoplay: kuyruk boşalınca son şarkıya benzer birini ara.
+        elif sira.autoplay:
+            await _autoplay_ekle(guild)
+    if not sira.kuyruk:
         sira.simdi_calan = None
         # Çalınacak şarkı kalmadı, botu tekrar sabit 7/24 ses kanalına gönder.
         try:
             await _sabit_ses_kanaline_baglan(guild, zorla_tasi=True)
         except Exception as e:
             print(f"Müzik bitince sabit kanala dönülemedi ({guild.name}): {e}")
+        await _panel_sil(guild)
         return
 
     sonraki = sira.kuyruk.pop(0)
@@ -1525,7 +1549,14 @@ async def _sonrakini_cal(guild: discord.Guild):
         await _sonrakini_cal(guild)
         return
 
+    # Geçmiş: eski çalan şarkıyı listeye ekle (en fazla 25).
+    if sira.simdi_calan is not None:
+        sira.gecmis.append(sira.simdi_calan)
+        if len(sira.gecmis) > 25:
+            sira.gecmis.pop(0)
+
     sira.simdi_calan = sonraki
+    sira.dongu_atlama = False
     seviye = _veri.get("ses_seviyesi", {}).get(str(guild.id), 80)
     options = FFMPEG_SECENEKLERI["options"]
     if 0 <= seviye <= 100 and seviye != 80:
@@ -1536,10 +1567,243 @@ async def _sonrakini_cal(guild: discord.Guild):
     sira.toplam_duraklatma = 0.0
     ses_client.play(kaynak, after=lambda e, g=guild: _sarki_bitince(g, e))
 
+    await _panel_gonder(guild, sonraki)
+
+
+async def _autoplay_ekle(guild: discord.Guild):
+    """Kuyruk boşalınca son çalınan şarkıya benzer bir şarkı arar ve kuyruğa ekler."""
+    sira = _sira_al(guild.id)
+    onceki = sira.gecmis[-1] if sira.gecmis else sira.simdi_calan
+    if onceki is None:
+        return
+    adaylar: list[dict] = []
     try:
-        await sonraki.kanal.send(f"🎵 Şimdi çalıyor: **{sonraki.baslik}** — istek: {sonraki.isteyen.mention}")
+        vid = None
+        m = re.search(r"[?&]v=([\w-]{11})", onceki.sorgu or "")
+        if m:
+            vid = m.group(1)
+        if vid:
+            ayarlar = dict(YTDLP_AYARLARI)
+            ayarlar["extract_flat"] = "in_playlist"
+            try:
+                bilgi = await asyncio.get_running_loop().run_in_executor(
+                    None, functools.partial(_sarki_ara_ayarla, ayarlar, f"https://www.youtube.com/watch?v={vid}&list=RD{vid}")
+                )
+                for giris in (bilgi.get("entries") or [])[:8]:
+                    if not giris or not giris.get("title"):
+                        continue
+                    url = giris.get("url") or ""
+                    if not url.startswith("http"):
+                        url = f"https://www.youtube.com/watch?v={url}"
+                    adaylar.append({"baslik": giris["title"], "sorgu": url,
+                                    "thumbnail": giris.get("thumbnail"),
+                                    "sure": _sure_metni(giris.get("duration"))})
+            except Exception:
+                adaylar = []
+    except Exception:
+        pass
+    if not adaylar:
+        # Yedek: başlıkla arama yap, aynı şarkıyı seçme.
+        try:
+            bilgi = await asyncio.get_running_loop().run_in_executor(
+                None, functools.partial(_sarki_ara, f"ytsearch5 {onceki.baslik}")
+            )
+            entries = bilgi.get("entries") or []
+            for giris in entries[:5]:
+                if giris and giris.get("title"):
+                    adaylar.append({"baslik": giris["title"], "sorgu": giris.get("webpage_url", ""),
+                                    "thumbnail": giris.get("thumbnail"),
+                                    "sure": _sure_metni(giris.get("duration"))})
+        except Exception:
+            pass
+    secilen = next((a for a in adaylar if a["sorgu"] and a["sorgu"] != onceki.sorgu), None)
+    if secilen is None:
+        return
+    kayit = SarkiKaydi(sorgu=secilen["sorgu"], baslik=secilen["baslik"], isteyen=guild.me,
+                       kanal=onceki.kanal, thumbnail=secilen.get("thumbnail"), sure=secilen.get("sure"))
+    sira.kuyruk.append(kayit)
+    print(f"[AUTOPLAY] {guild.name}: {secilen['baslik']} eklendi.")
+
+
+# ============================================
+# DISCORD'DA BUTONLU "ŞİMDİ ÇALIYOR" KARTI
+# ============================================
+_web_panel_mesajlari: dict[int, discord.Message] = {}  # guild_id -> butonlu kart mesajı
+
+
+def _dongu_etiket(dongu: int) -> str:
+    return {0: "Döngü: Yok", 1: "Döngü: Şarkı", 2: "Döngü: Kuyruk"}.get(dongu, "Döngü: Yok")
+
+
+class SimdiCaliyorView(discord.ui.View):
+    def __init__(self, guild: discord.Guild):
+        super().__init__(timeout=None)
+        self.guild = guild
+
+    async def _hareket(self, interaction: discord.Interaction, islem):
+        if interaction.guild is None:
+            return
+        await interaction.response.defer()
+        try:
+            await islem(interaction.guild)
+        except Exception as e:
+            print(f"Panel butonu hatası ({interaction.guild.name}): {e}")
+        await _panel_guncelle(interaction.guild)
+
+    @discord.ui.button(emoji="⏮️", label="Önceki", style=discord.ButtonStyle.secondary, custom_id="dvrms_panel_prev")
+    async def prev(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async def islem(guild):
+            sira = _sira_al(guild.id)
+            if sira.gecmis and sira.simdi_calan is not None:
+                geri = sira.gecmis.pop()
+                sira.kuyruk.insert(0, geri)
+                sira.dongu_atlama = True
+                ses_client = discord.utils.get(bot.voice_clients, guild=guild)
+                if ses_client is not None and (ses_client.is_playing() or ses_client.is_paused()):
+                    ses_client.stop()
+        await self._hareket(interaction, islem)
+
+    @discord.ui.button(emoji="⏸️", label="Duraklat", style=discord.ButtonStyle.secondary, custom_id="dvrms_panel_pause")
+    async def pause(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async def islem(guild):
+            sira = _sira_al(guild.id)
+            ses_client = discord.utils.get(bot.voice_clients, guild=guild)
+            if ses_client is None:
+                return
+            if ses_client.is_playing():
+                sira.duraklatma_an = time.time()
+                ses_client.pause()
+            elif ses_client.is_paused():
+                if sira.duraklatma_an is not None:
+                    sira.toplam_duraklatma += time.time() - sira.duraklatma_an
+                    sira.duraklatma_an = None
+                ses_client.resume()
+        await self._hareket(interaction, islem)
+
+    @discord.ui.button(emoji="⏭️", label="Atla", style=discord.ButtonStyle.secondary, custom_id="dvrms_panel_skip")
+    async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async def islem(guild):
+            sira = _sira_al(guild.id)
+            ses_client = discord.utils.get(bot.voice_clients, guild=guild)
+            if ses_client is not None and (ses_client.is_playing() or ses_client.is_paused()):
+                sira.dongu_atlama = True
+                ses_client.stop()
+        await self._hareket(interaction, islem)
+
+    @discord.ui.button(emoji="⏹️", label="Durdur", style=discord.ButtonStyle.danger, custom_id="dvrms_panel_stop")
+    async def stop(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async def islem(guild):
+            sira = _sira_al(guild.id)
+            sira.kuyruk.clear()
+            sira.simdi_calan = None
+            sira.baslama_zamani = None
+            sira.duraklatma_an = None
+            sira.toplam_duraklatma = 0.0
+            ses_client = discord.utils.get(bot.voice_clients, guild=guild)
+            if ses_client is not None:
+                if ses_client.is_playing() or ses_client.is_paused():
+                    ses_client.stop()
+                try:
+                    await ses_client.disconnect()
+                except discord.HTTPException:
+                    pass
+            await _panel_sil(guild)
+        await self._hareket(interaction, islem)
+
+    @discord.ui.button(emoji="🔀", label="Karıştır", style=discord.ButtonStyle.secondary, custom_id="dvrms_panel_shuffle")
+    async def shuffle(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async def islem(guild):
+            sira = _sira_al(guild.id)
+            if len(sira.kuyruk) > 1:
+                random.shuffle(sira.kuyruk)
+        await self._hareket(interaction, islem)
+
+    @discord.ui.button(emoji="🔁", label="Döngü", style=discord.ButtonStyle.secondary, custom_id="dvrms_panel_loop")
+    async def loop(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async def islem(guild):
+            sira = _sira_al(guild.id)
+            sira.dongu = (sira.dongu + 1) % 3
+            _veri.setdefault("dongu", {})[str(guild.id)] = sira.dongu
+            if sira.dongu == 2:
+                sira.dongu_cevir = list(sira.kuyruk)
+            elif sira.dongu == 0:
+                sira.dongu_cevir = []
+            _veri_kaydet()
+        await self._hareket(interaction, islem)
+
+
+def _panel_embed(guild: discord.Guild) -> discord.Embed | None:
+    sira = _sira_al(guild.id)
+    ses_client = discord.utils.get(bot.voice_clients, guild=guild)
+    if sira.simdi_calan is None:
+        return None
+    s = sira.simdi_calan
+    durum = "Duraklatıldı" if (ses_client and ses_client.is_paused()) else "Çalıyor"
+    embed = discord.Embed(
+        title=f"🎵 {durum}: {s.baslik}",
+        description=f"İstek: {s.isteyen.mention}\nSüre: {s.sure or '—'} · {_dongu_etiket(sira.dongu)}"
+                    + (" · 🔁 Autoplay" if sira.autoplay else ""),
+        color=discord.Color.purple(),
+    )
+    if s.thumbnail:
+        embed.set_thumbnail(url=s.thumbnail)
+    embed.set_footer(text=f"{guild.name} · DVRM Müzik Paneli")
+    return embed
+
+
+async def _panel_gonder(guild: discord.Guild, sonraki: SarkiKaydi | None = None):
+    """Şimdi çalıyor kartını gönderir; varsa mevcut mesajı düzenler."""
+    sira = _sira_al(guild.id)
+    if sira.simdi_calan is None:
+        await _panel_sil(guild)
+        return
+    kanal = (sonraki or sira.simdi_calan).kanal
+    if not isinstance(kanal, discord.TextChannel):
+        return
+    embed = _panel_embed(guild)
+    if embed is None:
+        await _panel_sil(guild)
+        return
+    mevcut = _web_panel_mesajlari.get(guild.id)
+    if mevcut is not None:
+        try:
+            await mevcut.edit(embed=embed, view=SimdiCaliyorView(guild))
+            return
+        except discord.HTTPException:
+            pass
+    try:
+        mesaj = await kanal.send(embed=embed, view=SimdiCaliyorView(guild))
+        _web_panel_mesajlari[guild.id] = mesaj
     except discord.HTTPException:
         pass
+
+
+async def _panel_guncelle(guild: discord.Guild):
+    """Butonlu karttaki embed ve buton etiketlerini günceller (duraklat/devam/döngü vb.)."""
+    mevcut = _web_panel_mesajlari.get(guild.id)
+    if mevcut is None:
+        return
+    sira = _sira_al(guild.id)
+    if sira.simdi_calan is None:
+        await _panel_sil(guild)
+        return
+    embed = _panel_embed(guild)
+    if embed is None:
+        await _panel_sil(guild)
+        return
+    try:
+        await mevcut.edit(embed=embed, view=SimdiCaliyorView(guild))
+    except discord.HTTPException:
+        _web_panel_mesajlari.pop(guild.id, None)
+
+
+async def _panel_sil(guild: discord.Guild):
+    mevcut = _web_panel_mesajlari.pop(guild.id, None)
+    if mevcut is not None:
+        try:
+            await mevcut.delete()
+        except discord.HTTPException:
+            pass
 
 
 @bot.tree.command(name="sil", description="Bu kanalda belirtilen sayıda son mesajı siler.")
@@ -1636,7 +1900,7 @@ async def play(interaction: discord.Interaction, sarki: str):
 
     sira = _sira_al(interaction.guild.id)
     kayit = SarkiKaydi(sorgu=sorgu, baslik=baslik, isteyen=interaction.user, kanal=interaction.channel,
-                       thumbnail=thumbnail, sure=sure)
+                       thumbnail=thumbnail, sure=sure, sure_sn=bilgi.get("duration"))
     sira.kuyruk.append(kayit)
 
     if sira.simdi_calan is None and not ses_client.is_playing() and not ses_client.is_paused():
@@ -1661,6 +1925,7 @@ async def skip(interaction: discord.Interaction):
         return
 
     baslik = sira.simdi_calan.baslik
+    sira.dongu_atlama = True  # şarkı döngüsü açıksa skip'te yeniden başlatmayı bastır
     ses_client.stop()  # after callback tetiklenip otomatik olarak sıradakine geçer
     await interaction.response.send_message(f"⏭️ **{baslik}** atlandı.")
 
@@ -1718,6 +1983,7 @@ async def duraklat(interaction: discord.Interaction):
     sira = _sira_al(interaction.guild.id)
     sira.duraklatma_an = time.time()
     await interaction.response.send_message("⏸️ Duraklatıldı.")
+    await _panel_guncelle(interaction.guild)
 
 
 @bot.tree.command(name="devam", description="Duraklatılmış şarkıyı devam ettirir.")
@@ -1737,6 +2003,7 @@ async def devam(interaction: discord.Interaction):
         sira.toplam_duraklatma += time.time() - sira.duraklatma_an
         sira.duraklatma_an = None
     await interaction.response.send_message("▶️ Devam ediyor.")
+    await _panel_guncelle(interaction.guild)
 
 
 @bot.tree.command(name="dur", description="Çalan müziği durdurur, kuyruğu temizler ve bot ses kanalından ayrılır.")
@@ -1758,7 +2025,108 @@ async def dur(interaction: discord.Interaction):
         ses_client.stop()
     await ses_client.disconnect()
 
+    await _panel_sil(interaction.guild)
+
     await interaction.response.send_message("⏹️ Müzik durduruldu, kuyruk temizlendi, ses kanalından ayrıldım.")
+
+
+@bot.tree.command(name="dongu", description="Döngü modunu ayarlar: yok / şarkı / kuyruk.")
+@app_commands.describe(mod="Döngü modu: yok, sarki veya kuyruk")
+@app_commands.choices(mod=[
+    app_commands.Choice(name="Yok", value=0),
+    app_commands.Choice(name="Şarkı", value=1),
+    app_commands.Choice(name="Kuyruk", value=2),
+])
+async def dongu(interaction: discord.Interaction, mod: app_commands.Choice[int]):
+    if interaction.guild is None:
+        await interaction.response.send_message("Bu komut sadece sunucuda kullanılabilir.", ephemeral=True)
+        return
+    sira = _sira_al(interaction.guild.id)
+    sira.dongu = mod.value
+    _veri.setdefault("dongu", {})[str(interaction.guild.id)] = mod.value
+    if mod.value == 2:
+        sira.dongu_cevir = list(sira.kuyruk)
+    elif mod.value == 0:
+        sira.dongu_cevir = []
+    _veri_kaydet()
+    await interaction.response.send_message(f"🔁 Döngü: **{mod.name}**")
+    await _panel_guncelle(interaction.guild)
+
+
+@bot.tree.command(name="karistir", description="Sıradaki şarkıları karıştırır.")
+async def karistir(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Bu komut sadece sunucuda kullanılabilir.", ephemeral=True)
+        return
+    sira = _sira_al(interaction.guild.id)
+    if len(sira.kuyruk) < 2:
+        await interaction.response.send_message("Karıştırmak için sırada en az 2 şarkı olmalı.", ephemeral=True)
+        return
+    random.shuffle(sira.kuyruk)
+    await interaction.response.send_message(f"🔀 Kuyruktaki {len(sira.kuyruk)} şarkı karıştırıldı.")
+
+
+@bot.tree.command(name="gecmis", description="Son çalınan şarkıları gösterir.")
+async def gecmis(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Bu komut sadece sunucuda kullanılabilir.", ephemeral=True)
+        return
+    sira = _sira_al(interaction.guild.id)
+    if not sira.gecmis:
+        await interaction.response.send_message("Henüz çalınmış şarkı yok.", ephemeral=True)
+        return
+    satirlar = ["**Son çalınanlar:**"]
+    for i, kayit in enumerate(reversed(sira.gecmis[-10:]), start=1):
+        satirlar.append(f"{i}. {kayit.baslik} — istek: {kayit.isteyen.name}")
+    await interaction.response.send_message("\n".join(satirlar))
+
+
+@bot.tree.command(name="gerial", description="Son çalınan şarkıyı tekrar çalar (geçmişten geri alır).")
+async def gerial(interaction: discord.Interaction):
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("Bu komut sadece sunucuda kullanılabilir.", ephemeral=True)
+        return
+    if interaction.user.voice is None or interaction.user.voice.channel is None:
+        await interaction.response.send_message("Önce bir ses kanalına girmen lazım.", ephemeral=True)
+        return
+    sira = _sira_al(interaction.guild.id)
+    if not sira.gecmis:
+        await interaction.response.send_message("Geçmişte çalınmış şarkı yok.", ephemeral=True)
+        return
+    geri = sira.gecmis.pop()
+    sira.kuyruk.insert(0, geri)
+    ses_client = discord.utils.get(bot.voice_clients, guild=interaction.guild)
+    if ses_client is None:
+        try:
+            ses_client = await interaction.user.voice.channel.connect()
+        except discord.ClientException as e:
+            await interaction.response.send_message(f"Kanala bağlanamadım: {e}")
+            return
+    elif ses_client.channel.id != interaction.user.voice.channel.id:
+        await ses_client.move_to(interaction.user.voice.channel)
+    if ses_client.is_playing() or ses_client.is_paused():
+        sira.dongu_atlama = True
+        ses_client.stop()  # sıradakine geçince geri alınan şarkı çalacak
+        await interaction.response.send_message(f"⏮️ Geçmişten geri alındı: **{geri.baslik}**")
+    else:
+        await interaction.response.send_message(f"⏮️ Geçmişten çalıyor: **{geri.baslik}**")
+        await _sonrakini_cal(interaction.guild)
+
+
+@bot.tree.command(name="autoplay", description="Kuyruk bitince benzer şarkıların otomatik çalmasını açar/kapatır.")
+async def autoplay(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Bu komut sadece sunucuda kullanılabilir.", ephemeral=True)
+        return
+    sira = _sira_al(interaction.guild.id)
+    sira.autoplay = not sira.autoplay
+    _veri.setdefault("autoplay", {})[str(interaction.guild.id)] = sira.autoplay
+    _veri_kaydet()
+    if sira.autoplay:
+        await interaction.response.send_message("🔁 Autoplay açıldı. Kuyruk bitince benzer şarkılar otomatik çalacak.")
+    else:
+        await interaction.response.send_message("🔁 Autoplay kapatıldı.")
+    await _panel_guncelle(interaction.guild)
 
 
 @bot.tree.command(name="724aktif", description="Bulunduğun ses kanalını 7/24 sabit kanal yapar, botu oraya gönderir.")
@@ -2376,6 +2744,7 @@ WEB_SESSION_SANIYE = 60 * 60 * 12  # 12 saat
 # basit oturum deposu: token -> user_id
 _web_oturumlar: dict[str, int] = {}
 _web_oturum_tarih: dict[str, float] = {}
+_web_secili_sunucu: dict[str, int] = {}  # token -> seçili guild_id (panelde sunucu değiştirme)
 
 
 class OnayView(discord.ui.View):
@@ -3278,6 +3647,7 @@ def _web_durum_json(guild: discord.Guild, user_id: int | None = None) -> dict:
         simdi = {
             "baslik": sira.simdi_calan.baslik,
             "sure": sira.simdi_calan.sure or "",
+            "sure_sn": sira.simdi_calan.sure_sn or 0,
             "thumbnail": sira.simdi_calan.thumbnail or "",
             "isteyen": sira.simdi_calan.isteyen.name,
             "sorgu": sira.simdi_calan.sorgu,
@@ -3340,6 +3710,8 @@ def _web_durum_json(guild: discord.Guild, user_id: int | None = None) -> dict:
     return {
         "guild": guild.name,
         "yetkili": user_id is not None and _web_kullanici_yetkili(guild, user_id),
+        "dongu": sira.dongu,
+        "autoplay": bool(sira.autoplay),
         "ses_kanali": ses_client.channel.name if ses_client and ses_client.is_connected() else None,
         "secili_kanal": secili,
         "caliyor": bool(ses_client and ses_client.is_playing()),
@@ -3407,6 +3779,7 @@ async def _web_oynat(guild: discord.Guild, sorgu: str, kullanici: discord.Member
         kanal=guild.system_channel,
         thumbnail=bilgi.get("thumbnail"),
         sure=_sure_metni(bilgi.get("duration")),
+        sure_sn=bilgi.get("duration"),
     )
 
     sira = _sira_al(guild.id)
@@ -3523,6 +3896,7 @@ header h1 span { background:linear-gradient(90deg,var(--accent),var(--accent2),v
 @keyframes gradshift { 0%,100%{ background-position:0% 50%; } 50%{ background-position:100% 50%; } }
 header h1 small { display:block; font-family:var(--font-body); font-size:10px; color:var(--muted); font-weight:500; letter-spacing:2.4px; text-transform:uppercase; margin-top:3px; }
 .usermenu { display:flex; align-items:center; gap:12px; font-size:14px; color:var(--muted); font-family:var(--font-body); }
+.usermenu .sunucu-sel { min-width:150px; max-width:230px; padding:8px 32px 8px 12px; border-radius:11px; font-size:13px; }
 .usermenu img { width:38px; height:38px; border-radius:50%; border:2px solid var(--accent); object-fit:cover; box-shadow:0 0 0 4px rgba(168,85,247,.18), 0 0 24px rgba(168,85,247,.3); }
 
 /* ---------- hero istatistik kartları ---------- */
@@ -3581,6 +3955,11 @@ button.ghost:hover:not(:disabled) { color:var(--text); border-color:var(--line2)
 @keyframes eq { 0%,100%{height:4px} 50%{height:14px} }
 .controls { display:flex; gap:10px; margin-top:18px; flex-wrap:wrap; align-items:center; }
 .controls .btn svg { width:15px; height:15px; }
+.btn-mini:disabled { opacity:.3; cursor:default; transform:none; }
+.progres { margin-top:16px; }
+.pbar { height:6px; border-radius:6px; background:rgba(168,85,247,.15); overflow:hidden; box-shadow:inset 0 1px 3px rgba(0,0,0,.4); }
+.pbar-dolu { height:100%; width:0%; background:linear-gradient(90deg,var(--accent),var(--accent2)); border-radius:6px; box-shadow:0 0 14px rgba(168,85,247,.6); transition:width .4s linear; }
+.pbilgi { display:flex; justify-content:space-between; color:var(--muted); font-size:11px; font-family:var(--font-mono); margin-top:6px; }
 
 /* ---------- formlar ---------- */
 .sel { -webkit-appearance:none; appearance:none;
@@ -3779,7 +4158,11 @@ const IK = {
   x: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
   kopyala: '<rect width="8" height="4" x="8" y="2" rx="1" ry="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/>',
   gonder: '<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>',
-  onay: '<path d="M20 6 9 17l-5-5"/>'
+  onay: '<path d="M20 6 9 17l-5-5"/>',
+  dongu: '<path d="m17 2 4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/>',
+  karistir: '<path d="m18 14 4 4-4 4"/><path d="m18 2 4 4-4 4"/><path d="M2 18h1.973a4 4 0 0 0 3.3-1.7l5.454-8.6a4 4 0 0 1 3.3-1.7H22"/><path d="M2 6h1.972a4 4 0 0 1 3.6 2.2"/><path d="M22 18h-6.041a4 4 0 0 1-3.3-1.8l-.359-.45"/>',
+  okYukari: '<path d="m18 15-6-6-6 6"/>',
+  okAsagi: '<path d="m6 9 6 6 6-6"/>'
 };
 
 function ik(ad, boyut, dolu) {
@@ -3866,15 +4249,34 @@ function cizPanel(durum) {
 
   let queueHtml = '<div class="empty">Sırada şarkı yok.</div>';
   if (durum.kuyruk.length) {
+    const son = durum.kuyruk.length - 1;
     queueHtml = `<div class="siralist">` + durum.kuyruk.map((k,i) =>
       `<div class="item"><span class="n">${i+1}</span><span class="t">${esc(k.baslik)}</span>
        <span class="s">${esc(k.sure)} · ${esc(k.isteyen)}</span>
+       <button class="btn-mini" onclick="siraTas(${i},${i-1})" title="Yukarı taşı" ${i===0?'disabled':''}>${ik('okYukari', 13)}</button>
+       <button class="btn-mini" onclick="siraTas(${i},${i+1})" title="Aşağı taşı" ${i===son?'disabled':''}>${ik('okAsagi', 13)}</button>
        <button class="btn-mini" onclick="siraSil(${i})" title="Sıradan kaldır">${ik('x', 13)}</button></div>`).join('') + `</div>`;
   }
 
   $('#simdi').innerHTML = nowHtml;
   $('#siraAdet').textContent = durum.kuyruk.length;
   $('#siraListe').innerHTML = queueHtml;
+
+  const btnDongu = $('#btnDongu');
+  if (btnDongu) btnDongu.innerHTML = ik('dongu', 15) + ' ' + ['Döngü: Yok','Döngü: Şarkı','Döngü: Kuyruk'][durum.dongu || 0] + (durum.autoplay ? ' · Auto' : '');
+
+  const prog = $('#progresKart');
+  if (prog) {
+    if (durum.simdi) {
+      prog.style.display = '';
+      const pToplam = $('#pToplam');
+      if (pToplam) pToplam.textContent = (durum.simdi.sure_sn ? formatSure(durum.simdi.sure_sn) : (durum.simdi.sure || '—'));
+      ilerlemeBaslat();
+    } else {
+      prog.style.display = 'none';
+      ilerlemeDurdur();
+    }
+  }
 
   $('#btnSkip').disabled = !durum.simdi;
   $('#btnPause').disabled = !(durum.caliyor && !durum.duraklatildi);
@@ -4120,12 +4522,18 @@ function cizIskeler() {
     <div class="card">
       <h2>${ik('kulaklik', 16)} Şimdi Çalıyor</h2>
       <div id="simdi"><div class="empty">Yükleniyor...</div></div>
+      <div id="progresKart" class="progres" style="display:none">
+        <div class="pbar"><div class="pbar-dolu" id="pbarDolu"></div></div>
+        <div class="pbilgi"><span id="pGecen">0:00</span><span id="pToplam">0:00</span></div>
+      </div>
       <div id="sozKart" class="soz-kart kapali"><div class="soz-yuk">${ik('mikrofon', 15)} Sözler için butona bas</div></div>
       <div class="controls">
         <button class="btn" id="btnSkip">${ik('sonraki', 15, true)} Geç</button>
         <button class="btn" id="btnPause">${ik('duraklat', 15, true)} Duraklat</button>
         <button class="btn" id="btnResume">${ik('oynat', 15, true)} Devam</button>
         <button class="btn ghost" id="btnStop">${ik('durdur', 15, true)} Durdur</button>
+        <button class="btn ghost" id="btnKaristir">${ik('karistir', 15)} Karıştır</button>
+        <button class="btn ghost" id="btnDongu">${ik('dongu', 15)} Döngü: Yok</button>
         <select class="sel" id="selChan"></select>
       </div>
     </div>
@@ -4234,6 +4642,8 @@ function cizIskeler() {
   $('#btnPause').onclick = async e => { try { await api('/api/duraklat',{method:'POST'}); tazele(); } catch{} };
   $('#btnResume').onclick = async e => { try { await api('/api/devam',{method:'POST'}); tazele(); } catch{} };
   $('#btnStop').onclick = async e => { e.target.disabled = true; try { await api('/api/durdur',{method:'POST'}); } catch{} setTimeout(tazele,1500); };
+  $('#btnKaristir').onclick = async e => { try { await api('/api/karistir',{method:'POST'}); toast(ik('karistir', 14) + ' Kuyruk karıştırıldı'); tazele(); } catch{} };
+  $('#btnDongu').onclick = donguDegistir;
   $('#btnAra').onclick = ara;
   $('#q').addEventListener('keydown', e => { if (e.key === 'Enter') ara(); });
   $('#selChan').addEventListener('change', async e => {
@@ -4271,6 +4681,46 @@ async function siraSil(i) {
   } catch {}
 }
 
+async function siraTas(i, hedef) {
+  if (hedef < 0) return;
+  try {
+    await api('/api/siratas', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({indeks: i, hedef}) });
+    tazele();
+  } catch {}
+}
+
+async function donguDegistir() {
+  const simdiki = (sonDurum && sonDurum.dongu) || 0;
+  const yeni = (simdiki + 1) % 3;
+  try {
+    const j = await api('/api/dongu', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({mod: yeni}) });
+    toast(ik('dongu', 14) + ' Döngü: ' + ['Yok','Şarkı','Kuyruk'][j.mod]);
+    tazele();
+  } catch {}
+}
+
+function formatSure(sn) {
+  sn = Math.max(0, Math.floor(sn || 0));
+  const dk = Math.floor(sn / 60), ss = sn % 60;
+  return dk + ':' + String(ss).padStart(2, '0');
+}
+
+let ilerlemeTimer = null;
+function ilerlemeBaslat() { if (!ilerlemeTimer) ilerlemeTimer = setInterval(ilerlemeTik, 1000); }
+function ilerlemeDurdur() { if (ilerlemeTimer) { clearInterval(ilerlemeTimer); ilerlemeTimer = null; } }
+async function ilerlemeTik() {
+  const kart = $('#progresKart');
+  if (!kart || kart.style.display === 'none') { ilerlemeDurdur(); return; }
+  let j;
+  try { j = await api('/api/pozisyon'); } catch { return; }
+  const gecen = $('#pGecen'); if (gecen) gecen.textContent = formatSure(j.pozisyon);
+  const sureSn = sonDurum && sonDurum.simdi ? (sonDurum.simdi.sure_sn || 0) : 0;
+  if (sureSn > 0) {
+    const dolu = $('#pbarDolu');
+    if (dolu) dolu.style.width = Math.min(100, ((j.pozisyon || 0) / sureSn) * 100) + '%';
+  }
+}
+
 async function ekle(i) {
   const box = $('#results');
   const s = sonSonuclar[i];
@@ -4296,15 +4746,42 @@ async function init() {
     const logoEl = $('#logoIkon');
     if (logoEl) logoEl.innerHTML = ik('kulaklik', 26);
     $('#usermenu').innerHTML = `
+      <select class="sel sunucu-sel" id="sunucuSec" title="Sunucu seç"></select>
       <img src="${esc(me.avatar)}" onerror="this.style.display='none'">
       <span>${esc(me.ad)}</span>
       <a class="btn ghost" href="/cikis">Çıkış</a>`;
+    await sunuculariYukle();
     cizIskeler();
     tazele();
     setInterval(tazele, 3000);
   } catch (e) {
     renderLogin();
   }
+}
+
+async function sunuculariYukle() {
+  const sel = $('#sunucuSec');
+  if (!sel) return;
+  try {
+    const s = await api('/api/sunucular');
+    sel.innerHTML = s.sunucular.map(g =>
+      `<option value="${g.id}" ${g.id === s.secili ? 'selected' : ''}>${esc(g.ad)}</option>`).join('') || '<option value="">Sunucu yok</option>';
+    sel.disabled = s.sunucular.length < 2;
+    sel.onchange = async e => {
+      if (!e.target.value) return;
+      try {
+        await api('/api/sunucu', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({sunucu_id: parseInt(e.target.value, 10)}) });
+        sonDurum = null;
+        sozKapat();
+        cizIskeler();
+        tazele();
+        toast(ik('onay', 14) + ' Sunucu değiştirildi');
+      } catch (err) {
+        toast(ik('uyari', 14) + ' Sunucu değiştirilemedi', true);
+        sunuculariYukle();
+      }
+    };
+  } catch {}
 }
 init();
 </script>
@@ -4394,15 +4871,65 @@ async def _web_me(request: aiohttp.web.Request) -> aiohttp.web.Response:
 
 
 def _web_hedef_guild(request: aiohttp.web.Request) -> tuple[discord.Guild, discord.Member] | None:
-    """Oturumdaki kullanıcının üyesi olduğu ilk sunucuyu döndürür."""
+    """Oturumdaki kullanıcının üyesi olduğu sunucuyu döndürür (panelde seçilene öncelik)."""
     user_id = _web_cookie_al(request)
     if user_id is None:
         return None
+    token = request.cookies.get("dvrms")
+    secili_id = _web_secili_sunucu.get(token) if token else None
+    if secili_id:
+        guild = bot.get_guild(secili_id)
+        uye = guild.get_member(user_id) if guild is not None else None
+        if uye is not None:
+            return guild, uye
     for guild in bot.guilds:
         uye = guild.get_member(user_id)
         if uye is not None:
             return guild, uye
     return None
+
+
+async def _web_sunucular(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    """Kullanıcının üyesi olduğu sunucuları (bot da oradaysa) listeler."""
+    user_id = _web_cookie_al(request)
+    if user_id is None:
+        return aiohttp.web.json_response({"hata": "yetki"}, status=401)
+    token = request.cookies.get("dvrms")
+    secili_id = _web_secili_sunucu.get(token) if token else None
+    liste = []
+    for guild in bot.guilds:
+        if guild.get_member(user_id) is None:
+            continue
+        liste.append({"id": str(guild.id), "ad": guild.name})
+        if secili_id is None:
+            secili_id = guild.id
+    liste.sort(key=lambda g: g["ad"].lower())
+    if secili_id is not None and str(secili_id) not in {g["id"] for g in liste}:
+        secili_id = int(liste[0]["id"]) if liste else None
+    return aiohttp.web.json_response({"sunucular": liste, "secili": str(secili_id) if secili_id else None})
+
+
+async def _web_sunucu_sec(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    """Panelde gösterilecek sunucuyu değiştirir: POST {sunucu_id}"""
+    user_id = _web_cookie_al(request)
+    if user_id is None:
+        return aiohttp.web.json_response({"hata": "yetki"}, status=401)
+    token = request.cookies.get("dvrms")
+    if not token:
+        return aiohttp.web.json_response({"hata": "yetki"}, status=401)
+    try:
+        veri = await request.json()
+    except Exception:
+        return aiohttp.web.json_response({"hata": "Geçersiz istek."})
+    try:
+        secili_id = int(veri.get("sunucu_id"))
+    except (TypeError, ValueError):
+        return aiohttp.web.json_response({"hata": "Geçersiz sunucu."})
+    guild = bot.get_guild(secili_id)
+    if guild is None or guild.get_member(user_id) is None:
+        return aiohttp.web.json_response({"hata": "Bu sunucuda değilsin."})
+    _web_secili_sunucu[token] = secili_id
+    return aiohttp.web.json_response({"ok": True, "sunucu": guild.name})
 
 
 async def _web_durum(request: aiohttp.web.Request) -> aiohttp.web.Response:
@@ -4646,6 +5173,8 @@ async def _web_atla(request: aiohttp.web.Request) -> aiohttp.web.Response:
     guild, _ = hedef
     ses_client = discord.utils.get(bot.voice_clients, guild=guild)
     if ses_client is not None and (ses_client.is_playing() or ses_client.is_paused()):
+        sira = _sira_al(guild.id)
+        sira.dongu_atlama = True
         ses_client.stop()
     return aiohttp.web.json_response({"ok": True})
 
@@ -4660,6 +5189,7 @@ async def _web_duraklat(request: aiohttp.web.Request) -> aiohttp.web.Response:
         sira = _sira_al(guild.id)
         sira.duraklatma_an = time.time()
         ses_client.pause()
+    await _panel_guncelle(guild)
     return aiohttp.web.json_response({"ok": True})
 
 
@@ -4675,6 +5205,7 @@ async def _web_devam(request: aiohttp.web.Request) -> aiohttp.web.Response:
             sira.toplam_duraklatma += time.time() - sira.duraklatma_an
             sira.duraklatma_an = None
         ses_client.resume()
+    await _panel_guncelle(guild)
     return aiohttp.web.json_response({"ok": True})
 
 
@@ -4697,7 +5228,72 @@ async def _web_durdur(request: aiohttp.web.Request) -> aiohttp.web.Response:
             await ses_client.disconnect()
         except discord.HTTPException:
             pass
+    await _panel_sil(guild)
     return aiohttp.web.json_response({"ok": True})
+
+
+async def _web_dongu(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    """Döngü modunu ayarlar: POST {mod: 0|1|2}"""
+    hedef = _web_hedef_guild(request)
+    if hedef is None:
+        return aiohttp.web.json_response({"hata": "yetki"}, status=401)
+    guild, _ = hedef
+    try:
+        veri = await request.json()
+    except Exception:
+        veri = {}
+    try:
+        mod = int(veri.get("mod"))
+    except (TypeError, ValueError):
+        return aiohttp.web.json_response({"hata": "Geçersiz mod."})
+    if mod not in (0, 1, 2):
+        return aiohttp.web.json_response({"hata": "Mod 0, 1 veya 2 olmalı."})
+    sira = _sira_al(guild.id)
+    sira.dongu = mod
+    _veri.setdefault("dongu", {})[str(guild.id)] = mod
+    if mod == 2:
+        sira.dongu_cevir = list(sira.kuyruk)
+    elif mod == 0:
+        sira.dongu_cevir = []
+    _veri_kaydet()
+    await _panel_guncelle(guild)
+    return aiohttp.web.json_response({"ok": True, "mod": mod})
+
+
+async def _web_karistir(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    """Sıradaki şarkıları karıştırır."""
+    hedef = _web_hedef_guild(request)
+    if hedef is None:
+        return aiohttp.web.json_response({"hata": "yetki"}, status=401)
+    guild, _ = hedef
+    sira = _sira_al(guild.id)
+    if len(sira.kuyruk) < 2:
+        return aiohttp.web.json_response({"hata": "Karıştırmak için sırada en az 2 şarkı olmalı."})
+    random.shuffle(sira.kuyruk)
+    return aiohttp.web.json_response({"ok": True, "adet": len(sira.kuyruk)})
+
+
+async def _web_sira_tas(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    """Sıradaki şarkıyı taşır: POST {indeks, hedef}"""
+    hedef = _web_hedef_guild(request)
+    if hedef is None:
+        return aiohttp.web.json_response({"hata": "yetki"}, status=401)
+    guild, _ = hedef
+    try:
+        veri = await request.json()
+    except Exception:
+        return aiohttp.web.json_response({"hata": "Geçersiz istek."})
+    try:
+        indeks = int(veri.get("indeks"))
+        hedef_i = int(veri.get("hedef"))
+    except (TypeError, ValueError):
+        return aiohttp.web.json_response({"hata": "Geçersiz indeks."})
+    sira = _sira_al(guild.id)
+    if not (0 <= indeks < len(sira.kuyruk)) or not (0 <= hedef_i < len(sira.kuyruk)):
+        return aiohttp.web.json_response({"hata": "Sıra dışı indeks."})
+    tasinan = sira.kuyruk.pop(indeks)
+    sira.kuyruk.insert(hedef_i, tasinan)
+    return aiohttp.web.json_response({"ok": True, "baslik": tasinan.baslik})
 
 
 async def _web_sozler(request: aiohttp.web.Request) -> aiohttp.web.Response:
@@ -4777,6 +5373,11 @@ async def _web_baslat():
     app.router.add_get("/api/sozler", _web_sozler)
     app.router.add_get("/api/pozisyon", _web_pozisyon)
     app.router.add_post("/api/begen", _web_begen)
+    app.router.add_post("/api/dongu", _web_dongu)
+    app.router.add_post("/api/karistir", _web_karistir)
+    app.router.add_post("/api/siratas", _web_sira_tas)
+    app.router.add_get("/api/sunucular", _web_sunucular)
+    app.router.add_post("/api/sunucu", _web_sunucu_sec)
 
     runner = aiohttp.web.AppRunner(app)
     await runner.setup()
