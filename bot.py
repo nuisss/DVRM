@@ -4770,7 +4770,7 @@ async function sunuculariYukle() {
     sel.onchange = async e => {
       if (!e.target.value) return;
       try {
-        await api('/api/sunucu', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({sunucu_id: parseInt(e.target.value, 10)}) });
+        await api('/api/sunucu', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({sunucu_id: e.target.value}) });
         sonDurum = null;
         sozKapat();
         cizIskeler();
