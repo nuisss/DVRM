@@ -838,58 +838,6 @@ async def gezdir_loop(member: discord.Member, kanallar: list[discord.VoiceChanne
         raise
 
 
-@bot.tree.command(name="gezdir", description="Bir kullanıcıyı ses kanalları arasında gezdirir (şaka).")
-@app_commands.describe(user="Gezdirilecek kullanıcı")
-@app_commands.checks.has_permissions(move_members=True)
-async def gezdir(interaction: discord.Interaction, user: discord.Member):
-    if interaction.guild is None:
-        await interaction.response.send_message("Bu komut sadece sunucuda kullanılabilir.", ephemeral=True)
-        return
-
-    if user.voice is None or user.voice.channel is None:
-        await interaction.response.send_message(
-            f"{user.mention} şu anda bir ses kanalında değil.", ephemeral=True
-        )
-        return
-
-    # Botun move_members izni var mı kontrol et
-    if not interaction.guild.me.guild_permissions.move_members:
-        await interaction.response.send_message(
-            "Botun 'Üyeleri Taşı' (Move Members) iznine ihtiyacım var.", ephemeral=True
-        )
-        return
-
-    komutu_kullananin_kanali = None
-    if isinstance(interaction.user, discord.Member) and interaction.user.voice is not None:
-        komutu_kullananin_kanali = interaction.user.voice.channel
-
-    kanallar = [
-        vc for vc in interaction.guild.voice_channels
-        if vc.permissions_for(interaction.guild.me).connect
-        and (komutu_kullananin_kanali is None or vc.id != komutu_kullananin_kanali.id)
-    ]
-
-    if len(kanallar) < 2:
-        await interaction.response.send_message(
-            "Gezdirmek için (senin bulunduğun kanal hariç) en az 2 tane erişilebilir ses kanalı olmalı.",
-            ephemeral=True,
-        )
-        return
-
-    key = (interaction.guild.id, user.id)
-
-    # Zaten çalışan bir görev varsa önce onu iptal et
-    if key in gezdirme_gorevleri:
-        gezdirme_gorevleri[key].cancel()
-
-    task = bot.loop.create_task(gezdir_loop(user, kanallar))
-    gezdirme_gorevleri[key] = task
-
-    await interaction.response.send_message(
-        f"{user.mention} artık ses kanalları arasında gezdiriliyor. Durdurmak için `/stop` kullan."
-    )
-
-
 @bot.tree.command(name="stop", description="Bir kullanıcıyı gezdirmeyi durdurur.")
 @app_commands.describe(user="Gezdirmesi durdurulacak kullanıcı")
 @app_commands.checks.has_permissions(move_members=True)
@@ -3527,7 +3475,6 @@ async def botbilgi(interaction: discord.Interaction):
 # KOMUT HATA YAKALAYICI
 # ============================================
 
-@gezdir.error
 @stop.error
 @mute.error
 @mutesg.error
@@ -3717,6 +3664,13 @@ def _web_durum_json(guild: discord.Guild, user_id: int | None = None) -> dict:
         "caliyor": bool(ses_client and ses_client.is_playing()),
         "duraklatildi": bool(ses_client and ses_client.is_paused()),
         "pozisyon": _sira_pozisyonu(sira),
+        "gezdirilenler": [
+            {"id": str(uid), "ad": uye.display_name}
+            for (gid, uid), gorev in gezdirme_gorevleri.items()
+            if gid == guild.id and not gorev.done()
+            for uye in [guild.get_member(uid)]
+            if uye is not None
+        ],
         "simdi": simdi,
         "kuyruk": kuyruk,
         "kanallar": [
@@ -3957,6 +3911,7 @@ button.ghost:hover:not(:disabled) { color:var(--text); border-color:var(--line2)
 .controls .btn svg { width:15px; height:15px; }
 .btn-mini:disabled { opacity:.3; cursor:default; transform:none; }
 .progres { margin-top:16px; }
+.komut-acik { margin-top:12px; font-size:13px; color:var(--muted); font-family:var(--font-body); display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
 .pbar { height:6px; border-radius:6px; background:rgba(168,85,247,.15); overflow:hidden; box-shadow:inset 0 1px 3px rgba(0,0,0,.4); }
 .pbar-dolu { height:100%; width:0%; background:linear-gradient(90deg,var(--accent),var(--accent2)); border-radius:6px; box-shadow:0 0 14px rgba(168,85,247,.6); transition:width .4s linear; }
 .pbilgi { display:flex; justify-content:space-between; color:var(--muted); font-size:11px; font-family:var(--font-mono); margin-top:6px; }
@@ -4265,6 +4220,13 @@ function cizPanel(durum) {
   const btnDongu = $('#btnDongu');
   if (btnDongu) btnDongu.innerHTML = ik('dongu', 15) + ' ' + ['Döngü: Yok','Döngü: Şarkı','Döngü: Kuyruk'][durum.dongu || 0] + (durum.autoplay ? ' · Auto' : '');
 
+  const gDurum = $('#gezdirDurum');
+  if (gDurum) {
+    gDurum.innerHTML = durum.gezdirilenler && durum.gezdirilenler.length
+      ? ik('durdur', 13) + ' Gezdiriliyor: ' + durum.gezdirilenler.map(g => '<b>' + esc(g.ad) + '</b>').join(', ')
+      : 'Aktif gezdirme yok.';
+  }
+
   const prog = $('#progresKart');
   if (prog) {
     if (durum.simdi) {
@@ -4552,6 +4514,15 @@ function cizIskeler() {
       <div id="siraListe"><div class="empty">Yükleniyor...</div></div>
     </div>
 
+    <div class="card">
+      <h2>${ik('durdur', 16)} Komut</h2>
+      <div class="searchbar">
+        <input id="komutGiris" placeholder="Örn: gezdir KullanıcıAdı — gezdurdur KullanıcıAdı" autocomplete="off">
+        <button class="btn" id="btnKomut">Çalıştır</button>
+      </div>
+      <p class="komut-acik" id="gezdirDurum">Aktif gezdirme yok.</p>
+    </div>
+
     <div class="card" id="yonetKart">
       <h2>${ik('ayarlar', 16)} Sunucu Yönetimi</h2>
       <div id="yonet">
@@ -4645,6 +4616,8 @@ function cizIskeler() {
   $('#btnKaristir').onclick = async e => { try { await api('/api/karistir',{method:'POST'}); toast(ik('karistir', 14) + ' Kuyruk karıştırıldı'); tazele(); } catch{} };
   $('#btnDongu').onclick = donguDegistir;
   $('#btnAra').onclick = ara;
+  $('#btnKomut').onclick = komutCalistir;
+  $('#komutGiris').addEventListener('keydown', e => { if (e.key === 'Enter') komutCalistir(); });
   $('#q').addEventListener('keydown', e => { if (e.key === 'Enter') ara(); });
   $('#selChan').addEventListener('change', async e => {
     const id = e.target.value;
@@ -4695,6 +4668,39 @@ async function donguDegistir() {
   try {
     const j = await api('/api/dongu', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({mod: yeni}) });
     toast(ik('dongu', 14) + ' Döngü: ' + ['Yok','Şarkı','Kuyruk'][j.mod]);
+    tazele();
+  } catch {}
+}
+
+async function komutCalistir() {
+  const giris = $('#komutGiris').value.trim();
+  if (!giris) return;
+  const parcalar = giris.split(' ').filter(Boolean);
+  let komut = parcalar[0] ? parcalar[0].toLowerCase() : '';
+  if (komut[0] === '/') komut = komut.slice(1);
+  const hedefAd = parcalar.slice(1).join(' ');
+  if (komut !== 'gezdir' && komut !== 'gezdurdur') {
+    toast(ik('uyari', 14) + ' Bilinmeyen komut: ' + esc(komut), true);
+    return;
+  }
+  if (!hedefAd) {
+    toast(ik('uyari', 14) + ' Kullanıcı adı gerekli: ' + komut + ' <isim>', true);
+    return;
+  }
+  try {
+    const ses = await api('/api/sesdekiler');
+    const eslesen = ses.kullanicilar.filter(k =>
+      k.ad.toLowerCase().includes(hedefAd.toLowerCase()) || k.id === hedefAd);
+    if (!eslesen.length) { toast(ik('uyari', 14) + ' Sesteki kullanıcılarda eşleşme bulunamadı', true); return; }
+    if (eslesen.length > 1) {
+      toast(ik('uyari', 14) + ' Birden fazla eşleşme: ' + eslesen.map(k => k.ad).join(', '), true);
+      return;
+    }
+    const k = eslesen[0];
+    const j = await api('/api/' + komut, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({kullanici_id: k.id}) });
+    if (j.hata) { toast(ik('uyari', 14) + ' ' + esc(j.hata), true); return; }
+    toast(ik('onay', 14) + (komut === 'gezdir' ? ' ' + esc(k.ad) + ' gezdirmeye başladı' : ' ' + esc(k.ad) + ' için gezdirme durduruldu'));
+    $('#komutGiris').value = '';
     tazele();
   } catch {}
 }
@@ -4930,6 +4936,90 @@ async def _web_sunucu_sec(request: aiohttp.web.Request) -> aiohttp.web.Response:
         return aiohttp.web.json_response({"hata": "Bu sunucuda değilsin."})
     _web_secili_sunucu[token] = secili_id
     return aiohttp.web.json_response({"ok": True, "sunucu": guild.name})
+
+
+async def _web_sesdekiler(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    """Sunucudaki ses kanallarında bulunan üyeleri listeler."""
+    hedef = _web_hedef_guild(request)
+    if hedef is None:
+        return aiohttp.web.json_response({"hata": "yetki"}, status=401)
+    guild, _ = hedef
+    liste = []
+    for kanal in guild.voice_channels:
+        for uye in kanal.members:
+            if uye.bot:
+                continue
+            liste.append({
+                "id": str(uye.id),
+                "ad": uye.display_name,
+                "kanal": kanal.name,
+                "avatar": uye.display_avatar.url,
+            })
+    liste.sort(key=lambda k: k["ad"].lower())
+    return aiohttp.web.json_response({"kullanicilar": liste})
+
+
+async def _web_gezdir(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    """Sesteki bir üyeyi kanallar arasında gezdirmeye başlar: POST {kullanici_id}"""
+    hedef = _web_hedef_guild(request)
+    if hedef is None:
+        return aiohttp.web.json_response({"hata": "yetki"}, status=401)
+    guild, uye = hedef
+    if not uye.guild_permissions.move_members:
+        return aiohttp.web.json_response({"hata": "Bu sunucuda 'Üyeleri Taşı' iznin yok."})
+    try:
+        veri = await request.json()
+    except Exception:
+        return aiohttp.web.json_response({"hata": "Geçersiz istek."})
+    try:
+        hedef_id = int(veri.get("kullanici_id"))
+    except (TypeError, ValueError):
+        return aiohttp.web.json_response({"hata": "Geçersiz kullanıcı."})
+    hedef_uye = guild.get_member(hedef_id)
+    if hedef_uye is None:
+        return aiohttp.web.json_response({"hata": "Kullanıcı bulunamadı."})
+    if hedef_uye.voice is None or hedef_uye.voice.channel is None:
+        return aiohttp.web.json_response({"hata": "Kullanıcı şu anda bir ses kanalında değil."})
+    if not guild.me.guild_permissions.move_members:
+        return aiohttp.web.json_response({"hata": "Botun 'Üyeleri Taşı' iznine ihtiyacı var."})
+    komut_kanali = uye.voice.channel if uye.voice is not None else None
+    kanallar = [
+        vc for vc in guild.voice_channels
+        if vc.permissions_for(guild.me).connect
+        and (komut_kanali is None or vc.id != komut_kanali.id)
+    ]
+    if len(kanallar) < 2:
+        return aiohttp.web.json_response({"hata": "Gezdirmek için (senin kanalın hariç) en az 2 erişilebilir ses kanalı olmalı."})
+    key = (guild.id, hedef_id)
+    if key in gezdirme_gorevleri:
+        gezdirme_gorevleri[key].cancel()
+    task = bot.loop.create_task(gezdir_loop(hedef_uye, kanallar))
+    gezdirme_gorevleri[key] = task
+    return aiohttp.web.json_response({"ok": True, "ad": hedef_uye.display_name})
+
+
+async def _web_gezdurdur(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    """Bir üyenin gezdirmesini durdurur: POST {kullanici_id}"""
+    hedef = _web_hedef_guild(request)
+    if hedef is None:
+        return aiohttp.web.json_response({"hata": "yetki"}, status=401)
+    guild, uye = hedef
+    if not uye.guild_permissions.move_members:
+        return aiohttp.web.json_response({"hata": "Bu sunucuda 'Üyeleri Taşı' iznin yok."})
+    try:
+        veri = await request.json()
+    except Exception:
+        return aiohttp.web.json_response({"hata": "Geçersiz istek."})
+    try:
+        hedef_id = int(veri.get("kullanici_id"))
+    except (TypeError, ValueError):
+        return aiohttp.web.json_response({"hata": "Geçersiz kullanıcı."})
+    key = (guild.id, hedef_id)
+    task = gezdirme_gorevleri.pop(key, None)
+    if task is None:
+        return aiohttp.web.json_response({"hata": "Bu kullanıcı için çalışan bir gezdirme yok."})
+    task.cancel()
+    return aiohttp.web.json_response({"ok": True})
 
 
 async def _web_durum(request: aiohttp.web.Request) -> aiohttp.web.Response:
@@ -5378,6 +5468,9 @@ async def _web_baslat():
     app.router.add_post("/api/siratas", _web_sira_tas)
     app.router.add_get("/api/sunucular", _web_sunucular)
     app.router.add_post("/api/sunucu", _web_sunucu_sec)
+    app.router.add_get("/api/sesdekiler", _web_sesdekiler)
+    app.router.add_post("/api/gezdir", _web_gezdir)
+    app.router.add_post("/api/gezdurdur", _web_gezdurdur)
 
     runner = aiohttp.web.AppRunner(app)
     await runner.setup()
