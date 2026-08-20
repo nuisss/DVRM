@@ -64,42 +64,32 @@ FFMPEG_SECENEKLERI = {
     "options": "-vn",
 }
 
-# Sunucuya yeni girenlere otomatik verilecek rol. Bu rol tüm normal
-# kanallardan gizlenir; sadece bot'un açtığı kişiye özel kanal görünür.
+# Sunucuya yeni girenlere otomatik verilecek rol. Tüm üyeler bu rolü alır ve
+# normal kanalları herkes gibi görebilir.
 UYE_ROLU_ADI = "Üye"
-
-async def _kanali_uye_rolunden_gizle(kanal: discord.abc.GuildChannel, rol: discord.Role) -> None:
-    """Tek bir kanalı 'Üye' rolünden gizler. Ses/sahne kanallarında ekstra olarak
-    bağlanma iznini de kapatır ki görse bile sese giremesin."""
-    izinler = {"view_channel": False, "reason": "üye rolünden kanalı gizle"}
-    if isinstance(kanal, (discord.VoiceChannel, discord.StageChannel)):
-        izinler["connect"] = False
-    await kanal.set_permissions(rol, **izinler)
 
 
 async def _uye_rolu_getir_veya_olustur(guild: discord.Guild) -> discord.Role:
-    """'Üye' rolünü döndürür; yoksa oluşturur ve mevcut tüm kanallardan gizler."""
+    """'Üye' rolünü döndürür; yoksa oluşturur."""
     rol = discord.utils.get(guild.roles, name=UYE_ROLU_ADI)
     if rol is not None:
         return rol
-
-    rol = await guild.create_role(
+    return await guild.create_role(
         name=UYE_ROLU_ADI,
         permissions=discord.Permissions.none(),
-        reason="otomatik üye rolü - varsayılan kanal erişimini kısıtlamak için",
+        reason="otomatik üye rolü",
     )
 
-    # Rol yeni oluşturulduğunda, mevcut tüm kanallardan bu rolü gizle.
-    # Böylece "Üye" rolüne sahip biri, bot'un kendisine özel açtığı kanal
-    # dışında (o kanalda zaten kişiye özel overwrite var, role ihtiyaç yok)
-    # hiçbir kanalı göremez.
+
+async def _uye_rolunu_kanallardan_ac(guild: discord.Guild) -> None:
+    """Eski kilit sisteminden kalan 'Üye' rolü override'larını temizler;
+    böylece tüm kanallar üye rolüne tekrar görünür olur."""
+    rol = await _uye_rolu_getir_veya_olustur(guild)
     for kanal in guild.channels:
         try:
-            await _kanali_uye_rolunden_gizle(kanal, rol)
+            await kanal.set_permissions(rol, overwrite=None)
         except discord.HTTPException:
             pass
-
-    return rol
 
 
 intents = discord.Intents.default()
@@ -108,17 +98,6 @@ intents.members = True
 intents.message_content = True  # isim mesajını okuyabilmek için gerekli
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-
-@bot.event
-async def on_guild_channel_create(channel: discord.abc.GuildChannel):
-    """Sunucuda yeni bir kanal (metin/ses/kategori) açıldığında, henüz rol almamış
-    'Üye' rolündeki kişilerden otomatik olarak gizler. Bu sayede yeni açılan bir
-    ses kanalı bile rol verilmeden görünmez/erişilmez olur."""
-    try:
-        rol = await _uye_rolu_getir_veya_olustur(channel.guild)
-        await _kanali_uye_rolunden_gizle(channel, rol)
-    except discord.HTTPException as e:
-        print(f"Yeni kanal Üye rolünden gizlenemedi ({channel}): {e}")
 
 
 # ============================================
@@ -726,7 +705,7 @@ async def on_ready():
             print(f"'{guild.name}' guild senkron hatası: {e}")
 
         try:
-            await _uye_rolu_getir_veya_olustur(guild)
+            await _uye_rolunu_kanallardan_ac(guild)
         except discord.HTTPException as e:
             print(f"'{UYE_ROLU_ADI}' rolü hazırlanamadı ({guild.name}): {e}")
 
@@ -773,46 +752,12 @@ async def on_member_join(member: discord.Member):
         discord.Color.green(),
     )
 
-    # --- 0) 'Üye' rolünü ver (kilitle/koruma sistemi bu role bağlı) ---
+    # --- 0) 'Üye' rolünü ver (koruma sistemi bu role bağlı) ---
     try:
         uye_rolu = await _uye_rolu_getir_veya_olustur(guild)
         await member.add_roles(uye_rolu, reason="sunucuya giriş - otomatik üye rolü")
     except discord.HTTPException as e:
         print(f"Üye rolü verilemedi ({member}): {e}")
-
-
-@bot.tree.command(
-    name="kilitle",
-    description="Tüm kanalları 'Üye' rolünden gizler (geriye dönük, yeni ses kanalları dahil).",
-)
-@app_commands.checks.has_permissions(manage_guild=True)
-async def kilitle(interaction: discord.Interaction):
-    if interaction.guild is None:
-        await interaction.response.send_message("Bu komut sadece sunucuda kullanılabilir.", ephemeral=True)
-        return
-
-    await interaction.response.defer(ephemeral=True)
-    guild = interaction.guild
-
-    try:
-        rol = await _uye_rolu_getir_veya_olustur(guild)
-    except discord.HTTPException as e:
-        await interaction.followup.send(f"'{UYE_ROLU_ADI}' rolü hazırlanamadı: {e}", ephemeral=True)
-        return
-
-    basarili = 0
-    basarisiz = 0
-    for kanal in guild.channels:
-        try:
-            await _kanali_uye_rolunden_gizle(kanal, rol)
-            basarili += 1
-        except discord.HTTPException:
-            basarisiz += 1
-
-    ozet = f"🔒 **{basarili}** kanal '{UYE_ROLU_ADI}' rolünden gizlendi/kilitlendi."
-    if basarisiz:
-        ozet += f" ({basarisiz} kanalda izin ayarlanamadı, bot'un yetkisini kontrol et.)"
-    await interaction.followup.send(ozet, ephemeral=True)
 
 
 async def gezdir_loop(member: discord.Member, kanallar: list[discord.VoiceChannel]):
@@ -3488,7 +3433,6 @@ async def botbilgi(interaction: discord.Interaction):
 @godmode.error
 @godmodedurdur.error
 @sil.error
-@kilitle.error
 @ticketpanel.error
 @play.error
 @skip.error
